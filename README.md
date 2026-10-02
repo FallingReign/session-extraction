@@ -65,12 +65,17 @@ recur across sessions, a card per session, and every user request in order.
 ## Agent skill
 
 ```sh
-node scripts/install-skill.mjs            # installs to ~/.agents/skills/session-extraction
+node scripts/install-skill.mjs            # installs every skill under skills/ to ~/.agents/skills
 ```
 
-The skill (`skill/SKILL.md`) tells an agent when to use each command, how to
-read the output, and to query the JSON for analysis. It is self-contained; re-run
-the installer after updating the repository.
+Two skills, both running the same code:
+
+- `session-extraction` — review and analyse sessions: when to use each command,
+  how to read the output, and to query the JSON for analysis.
+- `resume-codex-session` — continue a Codex session's work in another agent.
+
+Each is installed self-contained; re-run the installer after updating the
+repository.
 
 ## Where sessions are read from
 
@@ -114,7 +119,7 @@ src/sources/codex/              Codex adapter
 src/sources/copilot/            Copilot CLI adapter
 scripts/verify.mjs              fidelity harness
 scripts/install-skill.mjs       skill installer
-skill/SKILL.md                  agent skill
+skills/*/SKILL.md               agent skills
 probe/                          format survey scripts
 ```
 
