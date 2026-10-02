@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { readFirstLine } from '../../core/jsonl.mjs';
 
 export const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 export const SESSIONS_ROOT = path.join(CODEX_HOME, 'sessions');
@@ -38,30 +39,8 @@ export function walkRollouts(dir = SESSIONS_ROOT, out = []) {
   return out;
 }
 
-/** Read just enough bytes off the front of the file to parse the session_meta line. */
-function readFirstLine(file, chunkSize = 65536) {
-  const fd = fs.openSync(file, 'r');
-  try {
-    let buf = Buffer.alloc(0);
-    let pos = 0;
-    for (let i = 0; i < 16; i++) {
-      const chunk = Buffer.alloc(chunkSize);
-      const read = fs.readSync(fd, chunk, 0, chunkSize, pos);
-      if (read === 0) break;
-      pos += read;
-      buf = Buffer.concat([buf, chunk.subarray(0, read)]);
-      const nl = buf.indexOf(0x0a);
-      if (nl !== -1) return buf.subarray(0, nl).toString('utf8');
-    }
-    return buf.toString('utf8');
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-function headerFor(file) {
+function headerFor(file, stat) {
   const named = parseRolloutName(path.basename(file));
-  const stat = fs.statSync(file);
   let meta = null;
   try {
     const rec = JSON.parse(readFirstLine(file));
@@ -102,18 +81,24 @@ function loadTitles() {
 
 export const link = (id) => `codex://threads/${id}`;
 
-export function buildIndex({ onProgress } = {}) {
-  const files = walkRollouts();
+export function listFiles() {
+  return walkRollouts().map((file) => {
+    const s = fs.statSync(file);
+    return { file, mtimeMs: s.mtimeMs, size: s.size };
+  });
+}
+
+export const readHeader = (file, stat) => headerFor(file, stat);
+
+/** Group rollout headers into threads. Titles come from Codex's own index. */
+export function buildRefs(headers) {
   const titles = loadTitles();
   const byThread = new Map();
-  files.forEach((f, i) => {
-    if (onProgress && (i + 1) % 100 === 0) onProgress(i + 1, files.length);
-    const h = headerFor(f);
-    if (!h) return;
+  for (const h of headers) {
     const group = byThread.get(h.threadId);
     if (group) group.push(h);
     else byThread.set(h.threadId, [h]);
-  });
+  }
   return [...byThread.entries()].map(([id, segments]) => {
     segments.sort((a, b) => b.mtimeMs - a.mtimeMs);
     const newest = segments[0];
@@ -135,5 +120,3 @@ export function buildIndex({ onProgress } = {}) {
     };
   });
 }
-
-export const fingerprint = () => String(walkRollouts().length);

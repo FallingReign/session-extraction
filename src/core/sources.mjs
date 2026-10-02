@@ -1,26 +1,27 @@
 /**
  * Source registry: the one place that knows which adapters exist and how to
- * turn whatever the user supplied (link, UUID, folder path, words) into
- * sessions.
+ * turn whatever the user supplied (link, id, id prefix, session folder path,
+ * words) into sessions.
  *
  * Every adapter exposes the same surface:
  *   id, label, indexSchema
- *   buildIndex({ onProgress }) -> SessionRef[]
- *   fingerprint()              -> string, cheap change detector
+ *   listFiles() / readHeader(file, stat) / buildRefs(headers)
+ *                              incremental discovery (see core/index-cache.mjs)
  *   claim(raw)                 -> SessionRef | null for inputs only it understands
  *   filesFor(ref)              -> raw files, oldest first
  *   condense(ref, limits)      -> packet (see core/packet-builder.mjs)
- *   describe / replayEntry / turnIdOf for retrieval (see core/retrieve.mjs)
+ *   reader(), turnIdInLine     retrieval (see core/retrieve.mjs)
  *
  * SessionRef: { source, id, title, cwd, model, originator, startedAt,
- *               updatedAt, mtimeMs, bytes, segmentCount, files, link }
+ *               updatedAt, mtimeMs, bytes, segmentCount, files, link, ... }
  */
 import path from 'node:path';
 import codex from '../sources/codex/adapter.mjs';
+import copilot from '../sources/copilot/adapter.mjs';
 import { loadIndex } from './index-cache.mjs';
 import { extractUuid } from './text.mjs';
 
-export const ADAPTERS = [codex];
+export const ADAPTERS = [codex, copilot];
 
 export const adapterFor = (id) => ADAPTERS.find((a) => a.id === id) ?? null;
 

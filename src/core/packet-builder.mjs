@@ -8,6 +8,7 @@
  * Packet shape:
  *   session  identity and metadata (source, id, title, cwd, model, link, ...)
  *   instructions, plan, planDoc
+ *   summaries[]  checkpoint summaries the agent tool itself wrote (model-written)
  *   turns[]  { n, turnId, startedAt, endedAt, ask, askSource, notes[],
  *              reasoning[], actions[], final, durationMs }
  *   ledger   files, commands, errors, outstanding, mcp, searches, delegations
@@ -29,6 +30,7 @@ export class PacketBuilder {
     this.turns = [];
     this.turnIndex = new Map();
     this.files = new Map();
+    this.reads = new Map();
     this.commands = new Map();
     this.errors = [];
     this.successes = new Set();
@@ -38,6 +40,7 @@ export class PacketBuilder {
     this.instructions = null;
     this.plan = null;
     this.planDoc = null;
+    this.summaries = [];
     this.compactions = 0;
     this.totalTokens = 0;
     this.lastTokenRecord = null;
@@ -102,7 +105,7 @@ export class PacketBuilder {
     if (clean.length) turn.reasoning.push(...clean);
   }
 
-  command(turn, { cmd, exit = 0, ms = null, errorText = '', ts }) {
+  command(turn, { cmd, exit = 0, ms = null, errorText = '', ts, quiet = false }) {
     const ok = (exit ?? 0) === 0;
     const e = this.commands.get(cmd) ?? { cmd, runs: 0, failures: 0 };
     e.runs++;
@@ -117,20 +120,28 @@ export class PacketBuilder {
     } else {
       this.successes.add(cmdKey(cmd));
     }
-    turn.actions.push(action);
+    if (!quiet) turn.actions.push(action);
   }
 
-  fileChange(turn, { path, verb, lines = 0, ts }) {
+  fileChange(turn, { path, verb, lines = 0, ts, quiet = false }) {
     const e = this.files.get(path) ?? { path, add: 0, update: 0, delete: 0, lines: 0, firstTs: ts, lastTs: ts };
     e[verb] = (e[verb] ?? 0) + 1;
     e.lines += lines ?? 0;
     e.lastTs = ts;
     this.files.set(path, e);
-    turn.actions.push({ kind: 'file', verb, path, lines, ts, line: `${verb} ${path} (~${lines} lines)` });
+    if (!quiet) turn.actions.push({ kind: 'file', verb, path, lines, ts, line: `${verb} ${path} (~${lines} lines)` });
   }
 
-  tool(turn, { name, label = '', failed = false, ms = null, ts }) {
+  /** A file or folder the agent looked at without changing it. */
+  read(turn, { path, tool = 'view', ts, quiet = false }) {
+    if (!path) return;
+    this.reads.set(path, (this.reads.get(path) ?? 0) + 1);
+    if (!quiet) turn.actions.push({ kind: 'read', line: `${tool} ${path}`, ts });
+  }
+
+  tool(turn, { name, label = '', failed = false, ms = null, ts, quiet = false }) {
     this.mcp.set(name, (this.mcp.get(name) ?? 0) + 1);
+    if (quiet) return;
     turn.actions.push({
       kind: 'mcp',
       line: `${name}${label ? ` — ${oneLine(label, 140)}` : ''}`,
@@ -145,8 +156,8 @@ export class PacketBuilder {
     turn.actions.push({ kind: 'search', line: `web search — "${oneLine(query, 140)}"`, ts });
   }
 
-  action(turn, { kind, line, ts }) {
-    turn.actions.push({ kind, line, ts });
+  action(turn, { kind, line, ts, failed = false }) {
+    turn.actions.push({ kind, line, ts, failed });
   }
 
   delegation(entry) {
@@ -204,9 +215,11 @@ export class PacketBuilder {
       instructions: this.instructions,
       plan: this.plan,
       planDoc: this.planDoc,
+      summaries: this.summaries,
       turns: meaningful,
       ledger: {
         files: [...this.files.values()].sort((a, b) => b.add + b.update - (a.add + a.update)),
+        reads: [...this.reads.entries()].map(([p, n]) => ({ path: p, reads: n })).sort((a, b) => b.reads - a.reads),
         commands: commandList.sort((a, b) => b.runs - a.runs),
         errors: failures,
         outstanding,
@@ -222,6 +235,7 @@ export class PacketBuilder {
         commands: commandList.reduce((n, c) => n + c.runs, 0),
         uniqueCommands: this.commands.size,
         filesTouched: this.files.size,
+        filesRead: this.reads.size,
         errors: this.errors.length,
         outstandingErrors: outstanding.length,
         compactions: this.compactions,

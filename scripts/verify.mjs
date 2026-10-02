@@ -9,6 +9,7 @@
  *
  *   node scripts/verify.mjs [--source codex|copilot] [--sample=40] [--max-bytes=30000000]
  */
+import path from 'node:path';
 import { streamRecords } from '../src/core/jsonl.mjs';
 import { listSessions, adapterFor, ADAPTERS } from '../src/core/sources.mjs';
 import { renderMarkdown } from '../src/core/render-markdown.mjs';
@@ -23,8 +24,47 @@ const maxBytes = Number(arg('max-bytes', 30e6));
 const sampleSize = Number(arg('sample', 40));
 const onlySource = arg('source', null);
 
+process.removeAllListeners('warning');
+process.on('warning', (w) => {
+  if (w.name === 'ExperimentalWarning' && /sqlite/i.test(w.message)) return;
+  console.error(String(w));
+});
+
 /** Ground-truth counters, one per source format. */
 const GROUND_TRUTH = {
+  async copilot(ref) {
+    const truth = { commands: 0, failures: 0, files: new Set() };
+    const SHELL = /^(powershell|bash|shell|local_shell)$/;
+    const EDIT = /^(edit|str_replace|str-replace|create)$/;
+    const starts = new Map();
+    let cwd = ref.cwd;
+    const abs = (p) => (path.isAbsolute(p) || !cwd ? p : path.resolve(cwd, p));
+    for await (const { rec } of streamRecords(ref.files)) {
+      const d = rec.data ?? {};
+      if (rec.type === 'session.start' || rec.type === 'session.resume') cwd = d.context?.cwd ?? cwd;
+      if (rec.type === 'session.context_changed') cwd = d.cwd ?? cwd;
+      if (rec.type === 'tool.execution_start') starts.set(d.toolCallId, d);
+      if (rec.type !== 'tool.execution_complete') continue;
+      const s = starts.get(d.toolCallId);
+      if (!s) continue;
+      if (SHELL.test(s.toolName)) {
+        truth.commands++;
+        const tail = /exit code (-?\d+)>\s*$/.exec(String(d.result?.content ?? ''));
+        const code = d.shellExecution?.exitCode ?? (tail ? Number(tail[1]) : 0);
+        if (d.success === false || code !== 0) truth.failures++;
+      } else if (d.success !== false && EDIT.test(s.toolName) && s.arguments?.path) {
+        truth.files.add(abs(s.arguments.path));
+      } else if (d.success !== false && s.toolName === 'apply_patch') {
+        const patch = typeof s.arguments === 'string' ? s.arguments : (s.arguments?.input ?? '');
+        // Both sides of a move count as changed paths.
+        for (const m of patch.matchAll(/^\*\*\* (?:(?:Add|Update|Delete) File|Move to): (.+?)\s*$/gm)) {
+          truth.files.add(abs(m[1]));
+        }
+      }
+    }
+    return truth;
+  },
+
   async codex(ref) {
     const truth = { commands: 0, failures: 0, files: new Set() };
     const seen = new Set();

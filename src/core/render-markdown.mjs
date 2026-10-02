@@ -30,13 +30,21 @@ const human = (n) =>
 const ICON = {
   exec: '$',
   file: '±',
+  read: '›',
   mcp: '⚙',
   search: '?',
   ext: '·',
   image: '▣',
   delegate: '→',
   compaction: '✂',
+  skill: '★',
+  model: '◇',
+  abort: '■',
+  error: '!',
 };
+
+const SOURCE_LABELS = { codex: 'Codex', copilot: 'Copilot' };
+export const sourceLabel = (id) => SOURCE_LABELS[id] ?? id ?? 'Agent';
 
 /** Collapse a turn's actions into deduped, run-length-encoded lines. */
 function collapseActions(actions) {
@@ -74,48 +82,51 @@ const oneLine = (s, n) => {
   return t.length <= n ? t : t.slice(0, n) + '…';
 };
 
-/** The parts of the packet a resuming agent always needs, whatever the budget. */
+/** The parts of the packet a reader always needs, whatever the budget. */
 function renderSpine(packet, opts) {
   const { maxFiles = 60 } = opts;
   const L = [];
   const t = packet.session;
+  const label = sourceLabel(t.source);
 
-  L.push(`# Codex session handoff — ${t.title ?? 'untitled'}`);
+  L.push(`# ${label} session — ${t.title ?? 'untitled'}`);
   L.push('');
-  L.push('> Condensed record of a Codex session, produced deterministically — no summarisation model touched it.');
-  L.push('> Everything below is drawn verbatim or by rule from the original transcript.');
-  L.push('> Start at **Where things stand**; read the timeline only if you need the history.');
+  L.push(`> Condensed view of a ${label} session, produced deterministically: text is quoted verbatim or reduced by fixed rules.`);
+  L.push('> No model summarised anything here, except sections explicitly labelled as written by the agent tool itself.');
+  L.push('> Start at **Latest state**; read the timeline for history.');
   L.push('');
   L.push('| | |');
   L.push('|---|---|');
-  L.push(`| Thread | \`${t.id}\` |`);
-  L.push(`| Deep link | ${t.link} |`);
+  L.push(`| Session | \`${t.id}\` (${label}) |`);
+  L.push(`| Link | ${t.link} |`);
+  if (t.resume) L.push(`| Resume | \`${t.resume}\` |`);
   L.push(`| Working dir | \`${t.cwd ?? '—'}\` |`);
+  if (t.repository || t.branch) L.push(`| Repository | ${[t.repository, t.branch && `branch \`${t.branch}\``].filter(Boolean).join(', ')} |`);
   L.push(`| Model | ${t.model ?? '—'} (${t.originator ?? '—'}) |`);
   L.push(`| Span | ${fmtTime(t.startedAt)} → ${fmtTime(t.updatedAt)} |`);
   L.push(`| Source | ${human(t.bytes)}, ${t.segmentCount} file(s), ${packet.stats.sourceLines.toLocaleString()} records |`);
   L.push(
-    `| Activity | ${packet.stats.turns} turns · ${packet.stats.commands} commands · ${packet.stats.filesTouched} files · ${packet.stats.outstandingErrors ?? 0} outstanding failure(s)${packet.stats.compactions ? ` · ${packet.stats.compactions} compaction(s)` : ''} |`
+    `| Activity | ${packet.stats.turns} turns · ${packet.stats.commands} commands · ${packet.stats.filesTouched} files changed${packet.stats.filesRead ? ` · ${packet.stats.filesRead} files read` : ''} · ${packet.stats.outstandingErrors ?? 0} outstanding failure(s)${packet.stats.compactions ? ` · ${packet.stats.compactions} compaction(s)` : ''} |`
   );
   L.push('');
 
   const lastAsk = [...packet.turns].reverse().find((x) => x.ask);
   const lastFinal = [...packet.turns].reverse().find((x) => x.final);
 
-  L.push('## Where things stand');
+  L.push('## Latest state');
   L.push('');
   if (lastAsk) {
-    const label =
+    const askLabel =
       lastAsk.askSource === 'delegated-in' || lastAsk.askSource === 'delegated-message'
         ? 'Most recent brief handed to the agent'
         : 'Most recent request from the user';
-    L.push(`**${label}** _(turn ${lastAsk.n}, ${fmtTime(lastAsk.startedAt)})_:`);
+    L.push(`**${askLabel}** _(turn ${lastAsk.n}, ${fmtTime(lastAsk.startedAt)})_:`);
     L.push('');
     L.push(blockquote(lastAsk.ask));
     L.push('');
   }
   if (lastFinal) {
-    L.push(`**Last thing the Codex agent reported** _(turn ${lastFinal.n}, ${fmtTime(lastFinal.startedAt)})_:`);
+    L.push(`**Last reply from the agent** _(turn ${lastFinal.n}, ${fmtTime(lastFinal.startedAt)})_:`);
     L.push('');
     L.push(blockquote(lastFinal.final));
     L.push('');
@@ -171,16 +182,25 @@ function renderSpine(packet, opts) {
   }
 
   if (packet.ledger.files.length) {
-    L.push('## Files touched');
+    const showDeleted = packet.ledger.files.some((f) => f.delete);
+    L.push('## Files changed');
     L.push('');
-    L.push('| File | Created | Edited | ~Lines |');
-    L.push('|---|--:|--:|--:|');
+    L.push(showDeleted ? '| File | Created | Edited | Deleted | ~Lines |' : '| File | Created | Edited | ~Lines |');
+    L.push(showDeleted ? '|---|--:|--:|--:|--:|' : '|---|--:|--:|--:|');
     for (const f of packet.ledger.files.slice(0, maxFiles)) {
-      L.push(`| \`${f.path}\` | ${f.add || ''} | ${f.update || ''} | ${f.lines || ''} |`);
+      const del = showDeleted ? ` ${f.delete || ''} |` : '';
+      L.push(`| \`${f.path}\` | ${f.add || ''} | ${f.update || ''} |${del} ${f.lines || ''} |`);
     }
     if (packet.ledger.files.length > maxFiles) {
-      L.push(`| _…${packet.ledger.files.length - maxFiles} more (full list in the JSON packet)_ | | | |`);
+      L.push(`| _…${packet.ledger.files.length - maxFiles} more (full list in the JSON packet)_ | | | |${showDeleted ? ' |' : ''}`);
     }
+    L.push('');
+  }
+
+  const reads = packet.ledger.reads ?? [];
+  if (reads.length) {
+    const top = reads.slice(0, Math.max(10, Math.round(maxFiles / 3)));
+    L.push(`**Most-read files** (${reads.length} distinct): ${top.map((r) => `\`${r.path}\` ×${r.reads}`).join(', ')}${reads.length > top.length ? ', …' : ''}`);
     L.push('');
   }
 
@@ -216,8 +236,26 @@ function renderReference(packet, { maxCommands = 25 } = {}) {
     );
     L.push('');
   }
+  const delegations = (packet.ledger.delegations ?? []).filter((d) => d.report);
+  if (delegations.length) {
+    L.push('<details><summary>Sub-agent reports (first lines)</summary>');
+    L.push('');
+    for (const d of delegations.slice(-maxCommands)) L.push(`- **${d.kind}: ${d.summary}** — ${d.report}`);
+    L.push('');
+    L.push('</details>');
+    L.push('');
+  }
+  const summary = packet.summaries?.[packet.summaries.length - 1];
+  if (summary) {
+    L.push(`<details><summary>Latest checkpoint summary (written by ${sourceLabel(packet.session.source)} during the session, ${fmtTime(summary.ts)})</summary>`);
+    L.push('');
+    L.push(clipDoc(summary.text, 8000));
+    L.push('');
+    L.push('</details>');
+    L.push('');
+  }
   if (packet.instructions) {
-    L.push('<details><summary>AGENTS.md instructions in force during this session</summary>');
+    L.push('<details><summary>Custom instructions in force during this session</summary>');
     L.push('');
     L.push('```');
     L.push(packet.instructions.trim());
@@ -278,7 +316,7 @@ function renderTurn(turn, tier) {
     if (actions.length) {
       L.push('```');
       for (const a of actions) {
-        const mark = a.exit ? ' ✗' : '';
+        const mark = a.exit || a.failed ? ' ✗' : '';
         const times = a.count > 1 ? ` ×${a.count}` : '';
         L.push(`${ICON[a.kind] ?? '·'} ${a.line}${times}${mark}`);
       }
@@ -335,7 +373,7 @@ export function renderMarkdown(packet, opts = {}) {
     );
     L.push('');
     L.push(
-      `_Nothing is permanently lost: \`codex-migrate search ${packet.session.id.slice(0, 8)} "<text>"\` ` +
+      `_Nothing is permanently lost: \`session-extract search ${packet.session.id.slice(0, 8)} "<text>"\` ` +
         `searches the complete original transcript, including command output this packet drops._`
     );
     L.push('');
@@ -367,8 +405,8 @@ export function renderMarkdown(packet, opts = {}) {
       L.push(
         `> **${omitted} earlier turn(s) omitted** (turns ${omittedFrom.n}–${omittedTo.n}, ` +
           `${fmtTime(omittedFrom.startedAt)} → ${fmtTime(omittedTo.startedAt)}). ` +
-          `Their file changes and commands are still counted in the ledgers above. ` +
-          `Recover any of them with \`codex-migrate turn ${packet.session.id.slice(0, 8)} <n>\`.`
+          `Their file changes and commands are still counted above. ` +
+          `Recover any of them with \`session-extract turn ${packet.session.id.slice(0, 8)} <n>\`.`
       );
       L.push('');
       omitted = 0;
@@ -386,7 +424,7 @@ export function renderMarkdown(packet, opts = {}) {
   if (omitted) {
     L.push(
       `> **${omitted} turn(s) omitted** (turns ${omittedFrom.n}–${omittedTo.n}). ` +
-        `Recover with \`codex-migrate turn ${packet.session.id.slice(0, 8)} <n>\`.`
+        `Recover with \`session-extract turn ${packet.session.id.slice(0, 8)} <n>\`.`
     );
     L.push('');
   }
@@ -394,7 +432,7 @@ export function renderMarkdown(packet, opts = {}) {
   L.push(...reference);
   L.push('---');
   L.push(
-    `_Generated ${packet.generatedAt} from ${human(packet.stats.sourceBytes)} of Codex rollout data. Deterministic condensation — no model in the loop._`
+    `_Generated ${packet.generatedAt} from ${human(packet.stats.sourceBytes)} of ${sourceLabel(packet.session.source)} session data. Deterministic condensation — no model in the loop._`
   );
 
   return { markdown: L.join('\n'), budget };

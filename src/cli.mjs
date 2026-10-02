@@ -13,6 +13,14 @@ import { estTokens } from './core/budget.mjs';
 import { searchSession, replayTurn } from './core/retrieve.mjs';
 import { human, ago } from './core/text.mjs';
 
+// node:sqlite (used to read Copilot's per-session todo list) announces itself
+// as experimental on first use; that notice is noise for this tool's users.
+process.removeAllListeners('warning');
+process.on('warning', (w) => {
+  if (w.name === 'ExperimentalWarning' && /sqlite/i.test(w.message)) return;
+  console.error(String(w));
+});
+
 const HELP = `
   session-extract — context-dense views of Codex and Copilot sessions
 
@@ -59,7 +67,10 @@ function parseArgs(argv) {
 const flagStr = (v) => (v === true || v === undefined ? null : String(v));
 
 function printTable(sessions, limit = 20) {
-  const w = (s, n) => String(s ?? '').padEnd(n).slice(0, n);
+  const w = (s, n) => {
+    const v = String(s ?? '');
+    return (v.length >= n ? v.slice(0, n - 2) + '… ' : v).padEnd(n);
+  };
   if (!sessions.length) {
     console.log('  (no matching sessions)');
     return;

@@ -3,10 +3,13 @@
  *
  * Packets deliberately drop command output, tool payloads and older turns.
  * These functions stream the raw files again so any of that can be recovered
- * verbatim on demand. Adapters supply the format knowledge through:
- *   describe(rec)            -> { text, label, turnId } | null
- *   replayEntry(rec, limit)  -> { ts, label, text?, output?, stderr?, changes? } | null
- *   turnIdOf(rec)            -> string | null
+ * verbatim on demand. Adapters supply format knowledge through reader(),
+ * which returns a fresh, possibly stateful, object per pass:
+ *   describe(rec)          -> { text, label, turnId } | null
+ *   turnOf(rec)            -> turn id the record belongs to, or null
+ *   replay(rec, limit)     -> { ts, label, text?, output?, stderr?, changes? } | null
+ * Adapters whose records carry their turn id set turnIdInLine so replay can
+ * skip parsing unrelated lines.
  */
 import { streamLines } from './jsonl.mjs';
 
@@ -26,18 +29,19 @@ export async function searchSession(adapter, ref, query, opts = {}) {
   const lowered = needle.toLowerCase();
   const results = [];
   let scanned = 0;
+  const reader = adapter.reader();
 
   for await (const { line, file } of streamLines(adapter.filesFor(ref))) {
     scanned++;
-    // Cheap pre-filter on the raw line before paying for JSON.parse.
-    if (!regex && !line.toLowerCase().includes(lowered)) continue;
+    // Stateful readers must see every record; stateless ones can pre-filter.
+    if (!regex && adapter.turnIdInLine && !line.toLowerCase().includes(lowered)) continue;
     let rec;
     try {
       rec = JSON.parse(line);
     } catch {
       continue;
     }
-    const d = adapter.describe(rec);
+    const d = reader.describe(rec);
     if (!d?.text) continue;
     if (regex ? !re.test(d.text) : !d.text.toLowerCase().includes(lowered)) continue;
     if (kind && !d.label.toLowerCase().includes(kind.toLowerCase())) continue;
@@ -64,16 +68,17 @@ export async function replayTurn(adapter, ref, turnNumber, opts = {}) {
   if (!turn) return { found: false, turnCount: packet.turns.length };
 
   const events = [];
+  const reader = adapter.reader();
   for await (const { line } of streamLines(adapter.filesFor(ref))) {
-    if (!line.includes(turn.turnId)) continue;
+    if (adapter.turnIdInLine && !line.includes(turn.turnId)) continue;
     let rec;
     try {
       rec = JSON.parse(line);
     } catch {
       continue;
     }
-    if (adapter.turnIdOf(rec) !== turn.turnId) continue;
-    const entry = adapter.replayEntry(rec, maxOutputChars);
+    if (reader.turnOf(rec) !== turn.turnId) continue;
+    const entry = reader.replay(rec, maxOutputChars);
     if (entry) events.push(entry);
   }
   return { found: true, turnNumber, turnId: turn.turnId, turnCount: packet.turns.length, events };
