@@ -38,9 +38,13 @@ const ENVELOPE_HEADS = [
   '# Collaboration Mode',
 ];
 
+// Safety-review ("guardian") prompts replay the transcript to a reviewer model.
+// Both the initial form and the follow-up delta form are filtered.
 const GUARDIAN_MARKERS = [
   'whose request action you are assessing',
+  'since your last approval assessment',
   '>>> TRANSCRIPT START',
+  '>>> TRANSCRIPT DELTA START',
   'You are a security reviewer',
 ];
 
