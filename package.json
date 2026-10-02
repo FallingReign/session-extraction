@@ -1,0 +1,17 @@
+{
+  "name": "session-extraction",
+  "version": "0.1.0",
+  "description": "Deterministic, context-dense views of Codex and Copilot CLI agent sessions.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "session-extract": "src/cli.mjs"
+  },
+  "scripts": {
+    "verify": "node scripts/verify.mjs",
+    "install-skill": "node scripts/install-skill.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

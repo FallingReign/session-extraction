@@ -1,0 +1,15 @@
+# Generated packets and probe output contain real session text. Never commit them.
+out/
+packets/
+probe/*.txt
+probe/*.json
+probe/*.err
+*.packet.md
+*.packet.json
+codex-handoff-*
+session-view-*
+project-view-*
+
+node_modules/
+.DS_Store
+Thumbs.db
