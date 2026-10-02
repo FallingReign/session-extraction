@@ -78,7 +78,7 @@ const oneLine = (s, n) => {
 function renderSpine(packet, opts) {
   const { maxFiles = 60 } = opts;
   const L = [];
-  const t = packet.thread;
+  const t = packet.session;
 
   L.push(`# Codex session handoff — ${t.title ?? 'untitled'}`);
   L.push('');
@@ -89,11 +89,11 @@ function renderSpine(packet, opts) {
   L.push('| | |');
   L.push('|---|---|');
   L.push(`| Thread | \`${t.id}\` |`);
-  L.push(`| Deep link | ${t.deepLink} |`);
+  L.push(`| Deep link | ${t.link} |`);
   L.push(`| Working dir | \`${t.cwd ?? '—'}\` |`);
   L.push(`| Model | ${t.model ?? '—'} (${t.originator ?? '—'}) |`);
   L.push(`| Span | ${fmtTime(t.startedAt)} → ${fmtTime(t.updatedAt)} |`);
-  L.push(`| Source | ${human(t.bytes)}, ${t.segments} file(s), ${packet.stats.sourceLines.toLocaleString()} records |`);
+  L.push(`| Source | ${human(t.bytes)}, ${t.segmentCount} file(s), ${packet.stats.sourceLines.toLocaleString()} records |`);
   L.push(
     `| Activity | ${packet.stats.turns} turns · ${packet.stats.commands} commands · ${packet.stats.filesTouched} files · ${packet.stats.outstandingErrors ?? 0} outstanding failure(s)${packet.stats.compactions ? ` · ${packet.stats.compactions} compaction(s)` : ''} |`
   );
@@ -216,11 +216,11 @@ function renderReference(packet, { maxCommands = 25 } = {}) {
     );
     L.push('');
   }
-  if (packet.agentsMd) {
+  if (packet.instructions) {
     L.push('<details><summary>AGENTS.md instructions in force during this session</summary>');
     L.push('');
     L.push('```');
-    L.push(packet.agentsMd.trim());
+    L.push(packet.instructions.trim());
     L.push('```');
     L.push('');
     L.push('</details>');
@@ -335,7 +335,7 @@ export function renderMarkdown(packet, opts = {}) {
     );
     L.push('');
     L.push(
-      `_Nothing is permanently lost: \`codex-migrate search ${packet.thread.id.slice(0, 8)} "<text>"\` ` +
+      `_Nothing is permanently lost: \`codex-migrate search ${packet.session.id.slice(0, 8)} "<text>"\` ` +
         `searches the complete original transcript, including command output this packet drops._`
     );
     L.push('');
@@ -368,7 +368,7 @@ export function renderMarkdown(packet, opts = {}) {
         `> **${omitted} earlier turn(s) omitted** (turns ${omittedFrom.n}–${omittedTo.n}, ` +
           `${fmtTime(omittedFrom.startedAt)} → ${fmtTime(omittedTo.startedAt)}). ` +
           `Their file changes and commands are still counted in the ledgers above. ` +
-          `Recover any of them with \`codex-migrate turn ${packet.thread.id.slice(0, 8)} <n>\`.`
+          `Recover any of them with \`codex-migrate turn ${packet.session.id.slice(0, 8)} <n>\`.`
       );
       L.push('');
       omitted = 0;
@@ -386,7 +386,7 @@ export function renderMarkdown(packet, opts = {}) {
   if (omitted) {
     L.push(
       `> **${omitted} turn(s) omitted** (turns ${omittedFrom.n}–${omittedTo.n}). ` +
-        `Recover with \`codex-migrate turn ${packet.thread.id.slice(0, 8)} <n>\`.`
+        `Recover with \`codex-migrate turn ${packet.session.id.slice(0, 8)} <n>\`.`
     );
     L.push('');
   }

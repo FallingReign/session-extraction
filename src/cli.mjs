@@ -1,23 +1,46 @@
 #!/usr/bin/env node
 /**
- * codex-migrate — turn a Codex session into a compact handoff packet
- * that a Copilot agent can absorb without reading the raw rollout.
+ * session-extract — context-dense views of Codex and Copilot sessions.
+ * Run with no arguments for usage.
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import readline from 'node:readline';
-import {
-  loadIndex,
-  findByThreadId,
-  searchThreads,
-  threadsForCwd,
-  INDEX_PATH,
-  CACHE_DIR,
-} from './lib/index-store.mjs';
-import { condenseThread } from './lib/condense.mjs';
-import { renderMarkdown } from './lib/render-markdown.mjs';
-import { searchThread, replayTurn } from './lib/retrieve.mjs';
+import { listSessions, openSession, findSessions, sessionsForFolder, ADAPTERS } from './core/sources.mjs';
+import { CACHE_DIR } from './core/index-cache.mjs';
+import { renderMarkdown } from './core/render-markdown.mjs';
+import { estTokens } from './core/budget.mjs';
+import { searchSession, replayTurn } from './core/retrieve.mjs';
+import { human, ago } from './core/text.mjs';
+
+const HELP = `
+  session-extract — context-dense views of Codex and Copilot sessions
+
+  Find sessions
+    list [--limit N]                  most recent sessions
+    find <words>                      search titles, folders and ids
+    here [--folder <dir>] [--nested]  sessions started in a folder (default: current)
+    show <session>                    metadata for one session
+
+  View one session
+    view <session>                    write a packet: Markdown briefing + JSON data
+    view --find "<words>" | --here | --recent N
+
+  Drill into the original transcript (nothing the packet drops is lost)
+    search <session> "<text>" [--kind command] [--limit N] [--regex]
+    turn <session> <n>                replay one turn in full, with output
+
+  <session> is a codex://threads/<id> link, a session id, or the first 8+
+  characters of one.
+
+  Options
+    --source ${ADAPTERS.map((a) => a.id).join('|')}   limit to one tool (default: all)
+    --budget <tokens>                 fit packets to a token budget (default 40000)
+    --budget none                     render every turn in full
+    --out <dir>                       where packets are written
+    --stdout                          print the packet instead of writing files
+    --refresh                         rebuild the session index first
+`;
 
 function parseArgs(argv) {
   const out = { _: [], flags: {} };
@@ -33,240 +56,88 @@ function parseArgs(argv) {
   return out;
 }
 
-const human = (n) =>
-  n > 1e9 ? `${(n / 1e9).toFixed(2)}GB` : n > 1e6 ? `${(n / 1e6).toFixed(1)}MB` : `${Math.round(n / 1024)}KB`;
+const flagStr = (v) => (v === true || v === undefined ? null : String(v));
 
-const ago = (iso) => {
-  const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.round(m / 60);
-  return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
-};
-
-// Rough but stable: ~4 chars per token for English + code.
-const estTokens = (s) => Math.round(s.length / 4);
-
-function printTable(threads, limit = 20) {
+function printTable(sessions, limit = 20) {
   const w = (s, n) => String(s ?? '').padEnd(n).slice(0, n);
-  if (!threads.length) {
+  if (!sessions.length) {
     console.log('  (no matching sessions)');
     return;
   }
-  console.log('  ' + w('#', 4) + w('UPDATED', 10) + w('SIZE', 9) + w('TITLE', 40) + 'CWD');
-  threads.slice(0, limit).forEach((t, i) => {
-    console.log('  ' + w(i + 1, 4) + w(ago(t.updatedAt), 10) + w(human(t.bytes), 9) + w(t.title ?? '—', 40) + (t.cwd ?? '—'));
+  console.log('  ' + w('#', 4) + w('SOURCE', 8) + w('ID', 10) + w('UPDATED', 10) + w('SIZE', 9) + w('TITLE', 40) + 'FOLDER');
+  sessions.slice(0, limit).forEach((s, i) => {
+    console.log(
+      '  ' +
+        w(i + 1, 4) +
+        w(s.source, 8) +
+        w(s.id.slice(0, 8), 10) +
+        w(ago(s.updatedAt), 10) +
+        w(human(s.bytes), 9) +
+        w(s.title ?? '—', 40) +
+        (s.cwd ?? '—')
+    );
   });
-  if (threads.length > limit) console.log(`  …${threads.length - limit} more`);
+  if (sessions.length > limit) console.log(`  …${sessions.length - limit} more`);
 }
 
-async function pick(threads) {
-  if (!process.stdin.isTTY) return threads[0];
-  printTable(threads, 20);
+async function pick(sessions) {
+  if (!process.stdin.isTTY) return sessions[0];
+  printTable(sessions, 20);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise((r) => rl.question('\n  Pick a number (blank = 1): ', r));
   rl.close();
   const n = Number(answer.trim() || '1');
-  return threads[Math.max(1, Math.min(threads.length, n)) - 1];
+  return sessions[Math.max(1, Math.min(sessions.length, n)) - 1];
 }
 
-/** Resolve the thread the user meant from whatever they gave us. */
-async function resolveThread(index, args) {
-  const positional = args._[1];
-  if (positional) {
-    const direct = findByThreadId(index, positional);
-    if (direct) return direct;
+async function resolveOne(args, common) {
+  const raw = args._[1];
+  if (raw) {
+    const opened = await openSession(raw, common);
+    if (opened) return opened;
   }
-  if (args.flags.find || (positional && !findByThreadId(index, positional))) {
-    const q = args.flags.find === true ? positional : (args.flags.find ?? positional);
-    const hits = searchThreads(index, q);
-    if (!hits.length) return null;
-    if (hits.length === 1) return hits[0];
-    console.log(`\n  "${q}" matched ${hits.length} sessions:\n`);
-    return pick(hits);
+  let candidates = null;
+  if (args.flags.find || raw) candidates = findSessions(flagStr(args.flags.find) ?? raw, common);
+  else if (args.flags.here) candidates = sessionsForFolder(flagStr(args.flags.here) ?? process.cwd(), common);
+  else if (args.flags.recent) candidates = listSessions(common).slice(0, Number(flagStr(args.flags.recent) ?? 15));
+  if (!candidates?.length) return null;
+  const ref = candidates.length === 1 ? candidates[0] : await pick(candidates);
+  return openSession(ref.id, { ...common, source: ref.source });
+}
+
+async function requireOne(args, common) {
+  const opened = await resolveOne(args, common);
+  if (!opened) {
+    console.error(`\n  Could not identify a session from "${args._[1] ?? ''}". Try list, find or here.\n`);
+    process.exit(1);
   }
-  if (args.flags.here) {
-    const hits = threadsForCwd(index, args.flags.here === true ? process.cwd() : args.flags.here);
-    if (!hits.length) return null;
-    return hits.length === 1 ? hits[0] : pick(hits);
-  }
-  if (args.flags.recent) {
-    const n = Number(args.flags.recent === true ? 15 : args.flags.recent);
-    console.log(`\n  ${n} most recent Codex sessions:\n`);
-    return pick(index.threads.slice(0, n));
-  }
-  return null;
+  return opened;
 }
 
 function outputDir(args) {
   if (args.flags.out) return path.resolve(String(args.flags.out));
-  const sessionDir = process.env.COPILOT_SESSION_FILES || process.env.COPILOT_SESSION_DIR;
-  if (sessionDir) return path.join(sessionDir, sessionDir.endsWith('files') ? '' : 'files');
   return path.join(CACHE_DIR, 'packets');
 }
 
-const HELP = `
-  codex-migrate — condense a Codex session into a Copilot handoff packet
+const slugify = (s) =>
+  String(s ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 50) || 'session';
 
-  Selecting a session
-    codex-migrate resume codex://threads/<uuid>     by deep link
-    codex-migrate resume <uuid>                     by thread id
-    codex-migrate resume --find "login page"        fuzzy title/path search
-    codex-migrate resume --here                     sessions started in this directory
-    codex-migrate resume --recent 15                pick from the most recent N
+function budgetFrom(args) {
+  const v = args.flags.budget;
+  if (v === 'none' || v === 'full') return null;
+  return Number(v ?? 40000) || null;
+}
 
-  Options
-    --budget <tokens>            fit the packet to a token budget (default 40000)
-    --budget none                no budget; render every turn in full
-    --out <dir>                  where to write (default: Copilot session files/)
-    --stdout                     print the packet instead of writing it
-    --refresh                    rebuild the session index first
-
-  Drilling back into the full transcript (nothing is ever lost)
-    codex-migrate search <session> "<text>"   find anything, incl. command output
-    codex-migrate search <session> "<text>" --kind command --limit 5
-    codex-migrate turn <session> <n>          replay one turn at full fidelity
-
-  Other commands
-    codex-migrate list [--limit N]      recent sessions
-    codex-migrate find <query>          search sessions
-    codex-migrate here                  sessions for the current directory
-    codex-migrate show <id|link>        details for one session
-`;
-
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
-  const cmd = args._[0] ?? 'help';
-  if (cmd === 'help' || args.flags.help) {
-    console.log(HELP);
-    return;
-  }
-
-  let progressed = false;
-  const index = loadIndex({
-    refresh: Boolean(args.flags.refresh),
-    onProgress: (n, total) => {
-      progressed = true;
-      process.stderr.write(`\r  indexing ${n}/${total}…`);
-    },
-  });
-  if (progressed) process.stderr.write('\r' + ' '.repeat(40) + '\r');
-
-  if (cmd === 'list') {
-    console.log(`\n  ${index.threads.length} Codex threads / ${index.fileCount} rollout files`);
-    console.log(`  index: ${INDEX_PATH}\n`);
-    printTable(index.threads, Number(args.flags.limit ?? 20));
-    return;
-  }
-  if (cmd === 'find') {
-    const q = args._.slice(1).join(' ');
-    const hits = searchThreads(index, q);
-    console.log(`\n  "${q}" — ${hits.length} hit(s)\n`);
-    printTable(hits, Number(args.flags.limit ?? 20));
-    return;
-  }
-  if (cmd === 'here') {
-    const hits = threadsForCwd(index, args.flags.cwd || process.cwd());
-    console.log(`\n  ${hits.length} session(s) for ${path.resolve(args.flags.cwd || process.cwd())}\n`);
-    printTable(hits, Number(args.flags.limit ?? 20));
-    return;
-  }
-  if (cmd === 'show') {
-    const t = findByThreadId(index, args._[1]);
-    if (!t) {
-      console.error(`  no session for "${args._[1]}"`);
-      process.exit(1);
-    }
-    console.log(JSON.stringify(t, null, 2));
-    return;
-  }
-  if (cmd === 'search') {
-    const thread = findByThreadId(index, args._[1]) ?? (searchThreads(index, args._[1])[0] ?? null);
-    if (!thread) {
-      console.error(`  no session for "${args._[1]}"`);
-      process.exit(1);
-    }
-    const query = args._.slice(2).join(' ');
-    if (!query) {
-      console.error('  usage: codex-migrate search <session> "<text>"');
-      process.exit(2);
-    }
-    process.stderr.write(`  searching ${human(thread.bytes)} of transcript…\n`);
-    const res = await searchThread(thread, query, {
-      limit: Number(args.flags.limit ?? 15),
-      radius: Number(args.flags.context ?? 400),
-      regex: Boolean(args.flags.regex),
-      kind: args.flags.kind && args.flags.kind !== true ? String(args.flags.kind) : null,
-    });
-    console.log(`\n  "${query}" — ${res.total} match(es) in ${res.scanned.toLocaleString()} records`);
-    if (res.total > res.matches.length) {
-      console.log(`  showing the ${res.matches.length} most recent\n`);
-    } else console.log('');
-    for (const m of res.matches) {
-      console.log(`  ── ${m.ts}  ${m.label}`);
-      for (const line of m.excerpt.split('\n')) console.log('     ' + line);
-      console.log('');
-    }
-    return;
-  }
-
-  if (cmd === 'turn') {
-    const thread = findByThreadId(index, args._[1]) ?? (searchThreads(index, args._[1])[0] ?? null);
-    if (!thread) {
-      console.error(`  no session for "${args._[1]}"`);
-      process.exit(1);
-    }
-    const n = Number(args._[2]);
-    if (!n) {
-      console.error('  usage: codex-migrate turn <session> <turn number>');
-      process.exit(2);
-    }
-    const res = await replayTurn(thread, n, { maxOutputChars: Number(args.flags.output ?? 4000) });
-    if (!res.found) {
-      console.error(`  turn ${n} not found (session has ${res.turnCount} turns)`);
-      process.exit(1);
-    }
-    console.log(`\n  Turn ${n} of ${res.turnCount} — ${thread.title ?? thread.threadId}\n`);
-    for (const e of res.events) {
-      console.log(`  ── ${e.ts}  ${e.label}`);
-      if (e.text) for (const l of e.text.split('\n')) console.log('     ' + l);
-      if (e.changes) {
-        for (const c of e.changes) {
-          console.log(`     [${c.type}] ${c.path}`);
-          for (const l of c.body.split('\n')) console.log('       | ' + l);
-        }
-      }
-      if (e.stderr) {
-        console.log('     stderr:');
-        for (const l of e.stderr.split('\n')) console.log('       ' + l);
-      }
-      if (e.output) for (const l of e.output.split('\n')) console.log('       ' + l);
-      console.log('');
-    }
-    return;
-  }
-
-  if (cmd !== 'resume') {
-    console.error(`  unknown command "${cmd}"`);
-    console.log(HELP);
-    process.exit(2);
-  }
-
-  const thread = await resolveThread(index, args);
-  if (!thread) {
-    console.error('\n  Could not identify a session. Try --recent 15, --here, or --find "<words>".\n');
-    process.exit(1);
-  }
-
-  const depth = String(args.flags.depth ?? 'standard');
-  const budgetTokens =
-    args.flags.budget === 'none' || args.flags.budget === 'full'
-      ? null
-      : Number(args.flags.budget ?? (depth === 'lean' ? 12000 : depth === 'full' ? 0 : 40000)) || null;
-
-  process.stderr.write(`\n  Reading ${human(thread.bytes)} across ${thread.files.length} file(s)…\n`);
+async function cmdView(args, common) {
+  const { adapter, ref } = await requireOne(args, common);
+  const budgetTokens = budgetFrom(args);
+  process.stderr.write(`\n  Reading ${human(ref.bytes)} of ${adapter.label} session data…\n`);
   const started = Date.now();
-  // The JSON packet stays at full fidelity; the renderer is what trims.
-  const packet = await condenseThread(thread, { keepReasoning: true });
+  const packet = await adapter.condense(ref);
   const { markdown: md, budget } = renderMarkdown(packet, { budgetTokens });
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
 
@@ -277,44 +148,148 @@ async function main() {
 
   const dir = outputDir(args);
   fs.mkdirSync(dir, { recursive: true });
-  const slug = (packet.thread.title ?? 'codex-session')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 50) || 'codex-session';
-  const base = `codex-handoff-${slug}-${thread.threadId.slice(0, 8)}`;
+  const base = `session-view-${ref.source}-${slugify(packet.session.title)}-${ref.id.slice(0, 8)}`;
   const mdPath = path.join(dir, `${base}.md`);
   const jsonPath = path.join(dir, `${base}.json`);
   fs.writeFileSync(mdPath, md, 'utf8');
   fs.writeFileSync(jsonPath, JSON.stringify(packet, null, 2), 'utf8');
 
-  const ratio = thread.bytes / Math.max(1, md.length);
+  const s = packet.stats;
   console.log('');
-  console.log(`  Session   ${packet.thread.title ?? thread.threadId}`);
-  console.log(`  Deep link ${thread.deepLink}`);
-  console.log(`  Source    ${human(thread.bytes)} · ${packet.stats.sourceLines.toLocaleString()} records · read in ${elapsed}s`);
-  console.log(`  Packet    ${human(md.length)} · ~${estTokens(md).toLocaleString()} tokens · ${ratio.toFixed(0)}× smaller`);
+  console.log(`  Session   ${packet.session.title ?? ref.id}  (${adapter.label})`);
+  console.log(`  Link      ${ref.link}`);
+  console.log(`  Source    ${human(ref.bytes)} · ${s.sourceLines.toLocaleString()} records · read in ${elapsed}s`);
+  console.log(`  Packet    ${human(md.length)} · ~${estTokens(md.length).toLocaleString()} tokens`);
   console.log(
-    `  Content   ${packet.stats.turns} turns · ${packet.stats.commands} commands (${packet.stats.uniqueCommands} unique) · ${packet.stats.filesTouched} files · ${packet.stats.outstandingErrors} outstanding failure(s)`
+    `  Content   ${s.turns} turns · ${s.commands} commands (${s.uniqueCommands} unique) · ${s.filesTouched} files · ${s.outstandingErrors} outstanding failure(s)`
   );
   if (budget.fitted) {
     console.log(
-      `  Fitted    ${budget.counts.full} full / ${budget.counts.brief} brief / ${budget.counts.digest} one-line turns (unabridged ~${budget.fullTokens.toLocaleString()} tokens)`
+      `  Fitted    ${budget.counts.full} full / ${budget.counts.brief} brief / ${budget.counts.digest} one-line / ${budget.counts.omit} omitted (unabridged ~${budget.fullTokens.toLocaleString()} tokens)`
     );
   }
-  console.log('');
-  console.log(`  → ${mdPath}`);
-  console.log(`  → ${jsonPath}`);
-  console.log('');
-  if (budget.fitted) {
-    console.log('  Nothing was lost. Drill back into the original transcript with:');
-    console.log(`    codex-migrate search ${thread.threadId.slice(0, 8)} "<text>"`);
-    console.log(`    codex-migrate turn   ${thread.threadId.slice(0, 8)} <turn number>`);
+  console.log(`\n  → ${mdPath}\n  → ${jsonPath}\n`);
+}
+
+async function cmdSearch(args, common) {
+  const { adapter, ref } = await requireOne(args, common);
+  const query = args._.slice(2).join(' ');
+  if (!query) {
+    console.error('  usage: search <session> "<text>"');
+    process.exit(2);
+  }
+  process.stderr.write(`  searching ${human(ref.bytes)} of transcript…\n`);
+  const res = await searchSession(adapter, ref, query, {
+    limit: Number(args.flags.limit ?? 15),
+    radius: Number(args.flags.context ?? 400),
+    regex: Boolean(args.flags.regex),
+    kind: flagStr(args.flags.kind),
+  });
+  console.log(`\n  "${query}" — ${res.total} match(es) in ${res.scanned.toLocaleString()} records`);
+  console.log(res.total > res.matches.length ? `  showing the ${res.matches.length} most recent\n` : '');
+  for (const m of res.matches) {
+    console.log(`  ── ${m.ts}  ${m.label}`);
+    for (const line of m.excerpt.split('\n')) console.log('     ' + line);
     console.log('');
   }
 }
 
+async function cmdTurn(args, common) {
+  const { adapter, ref } = await requireOne(args, common);
+  const n = Number(args._[2]);
+  if (!n) {
+    console.error('  usage: turn <session> <n>');
+    process.exit(2);
+  }
+  const res = await replayTurn(adapter, ref, n, { maxOutputChars: Number(args.flags.output ?? 4000) });
+  if (!res.found) {
+    console.error(`  turn ${n} not found (session has ${res.turnCount} turns)`);
+    process.exit(1);
+  }
+  console.log(`\n  Turn ${n} of ${res.turnCount} — ${ref.title ?? ref.id}\n`);
+  for (const e of res.events) {
+    console.log(`  ── ${e.ts}  ${e.label}`);
+    if (e.text) for (const l of e.text.split('\n')) console.log('     ' + l);
+    for (const c of e.changes ?? []) {
+      console.log(`     [${c.type}] ${c.path}`);
+      for (const l of c.body.split('\n')) console.log('       | ' + l);
+    }
+    if (e.stderr) {
+      console.log('     stderr:');
+      for (const l of e.stderr.split('\n')) console.log('       ' + l);
+    }
+    if (e.output) for (const l of e.output.split('\n')) console.log('       ' + l);
+    console.log('');
+  }
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const cmd = args._[0];
+  if (!cmd || cmd === 'help' || args.flags.help) {
+    console.log(HELP);
+    return;
+  }
+
+  let progressed = false;
+  const common = {
+    source: flagStr(args.flags.source),
+    refresh: Boolean(args.flags.refresh),
+    onProgress: (adapter, n, total) => {
+      progressed = true;
+      process.stderr.write(`\r  indexing ${adapter.label} ${n}/${total}…`);
+    },
+  };
+  const clearProgress = () => {
+    if (progressed) process.stderr.write('\r' + ' '.repeat(50) + '\r');
+    progressed = false;
+  };
+
+  switch (cmd) {
+    case 'list': {
+      const all = listSessions(common);
+      clearProgress();
+      console.log(`\n  ${all.length} sessions\n`);
+      printTable(all, Number(args.flags.limit ?? 20));
+      return;
+    }
+    case 'find': {
+      const q = args._.slice(1).join(' ');
+      const hits = findSessions(q, common);
+      clearProgress();
+      console.log(`\n  "${q}" — ${hits.length} hit(s)\n`);
+      printTable(hits, Number(args.flags.limit ?? 20));
+      return;
+    }
+    case 'here': {
+      const folder = flagStr(args.flags.folder) ?? args._[1] ?? process.cwd();
+      const hits = sessionsForFolder(folder, { ...common, nested: Boolean(args.flags.nested) });
+      clearProgress();
+      console.log(`\n  ${hits.length} session(s) in ${path.resolve(folder)}\n`);
+      printTable(hits, Number(args.flags.limit ?? 50));
+      return;
+    }
+    case 'show': {
+      const { ref } = await requireOne(args, common);
+      clearProgress();
+      console.log(JSON.stringify(ref, null, 2));
+      return;
+    }
+    case 'view':
+      return cmdView(args, common);
+    case 'search':
+      return cmdSearch(args, common);
+    case 'turn':
+      return cmdTurn(args, common);
+    default:
+      console.error(`  unknown command "${cmd}"`);
+      console.log(HELP);
+      process.exit(2);
+  }
+}
+
 main().catch((err) => {
-  console.error('\n  codex-migrate failed:', err?.stack ?? err);
+  console.error('\n  session-extract failed:', err?.message ?? err);
+  if (process.env.DEBUG) console.error(err?.stack);
   process.exit(1);
 });

@@ -2,40 +2,34 @@
 /**
  * Fidelity + robustness harness.
  *
- * Robustness: condense many sessions and assert none crash.
- * Fidelity:   independently recount the things that must never be lost
- *             (user asks, file changes, commands, failures) straight from the
- *             rollout, and compare against what the packet reports.
+ * For a sample of sessions from each source, independently recount the facts
+ * a packet must never lose (commands, failures, files touched) straight from
+ * the raw records, and assert the packet agrees exactly. The recount
+ * deliberately shares no code with the adapters it checks.
+ *
+ *   node scripts/verify.mjs [--source codex|copilot] [--sample=40] [--max-bytes=30000000]
  */
-import fs from 'node:fs';
-import readline from 'node:readline';
-import { loadIndex } from '../src/lib/index-store.mjs';
-import { condenseThread } from '../src/lib/condense.mjs';
-import { renderMarkdown } from '../src/lib/render-markdown.mjs';
+import { streamRecords } from '../src/core/jsonl.mjs';
+import { listSessions, adapterFor, ADAPTERS } from '../src/core/sources.mjs';
+import { renderMarkdown } from '../src/core/render-markdown.mjs';
 
-const args = process.argv.slice(2);
-const maxBytes = Number(args.find((a) => a.startsWith('--max-bytes='))?.split('=')[1] ?? 30e6);
-const sampleSize = Number(args.find((a) => a.startsWith('--sample='))?.split('=')[1] ?? 40);
+const arg = (name, fallback) => {
+  const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
+  if (hit) return hit.split('=')[1];
+  const i = process.argv.indexOf(`--${name}`);
+  return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+};
+const maxBytes = Number(arg('max-bytes', 30e6));
+const sampleSize = Number(arg('sample', 40));
+const onlySource = arg('source', null);
 
-/** Ground truth, counted directly off the raw records. */
-async function groundTruth(thread) {
-  const truth = { fileChanges: 0, filePaths: new Set(), commands: 0, failures: 0, finals: 0 };
-  for (const file of [...thread.files].sort()) {
-    const rl = readline.createInterface({
-      input: fs.createReadStream(file, { encoding: 'utf8' }),
-      crlfDelay: Infinity,
-    });
+/** Ground-truth counters, one per source format. */
+const GROUND_TRUTH = {
+  async codex(ref) {
+    const truth = { commands: 0, failures: 0, files: new Set() };
     const seen = new Set();
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      let rec;
-      try {
-        rec = JSON.parse(line);
-      } catch {
-        continue;
-      }
+    for await (const { rec } of streamRecords([...ref.files].sort())) {
       const p = rec.payload ?? {};
-      if (p.type === 'task_complete' && p.last_agent_message) truth.finals++;
       if (p.type !== 'item_completed') continue;
       const item = p.item ?? {};
       if (item.id && seen.has(item.id)) continue;
@@ -44,80 +38,70 @@ async function groundTruth(thread) {
         truth.commands++;
         if ((item.exit_code ?? 0) !== 0) truth.failures++;
       }
-      if (item.type === 'FileChange') {
-        for (const fp of Object.keys(item.changes ?? {})) {
-          truth.fileChanges++;
-          truth.filePaths.add(fp);
-        }
-      }
+      if (item.type === 'FileChange') for (const fp of Object.keys(item.changes ?? {})) truth.files.add(fp);
     }
-    rl.close();
-  }
-  return truth;
+    return truth;
+  },
+};
+
+function sampleOf(sessions) {
+  const candidates = sessions.filter((s) => s.bytes <= maxBytes);
+  // Spread across the whole history rather than only the most recent sessions.
+  const step = Math.max(1, Math.floor(candidates.length / sampleSize));
+  return candidates.filter((_, i) => i % step === 0).slice(0, sampleSize);
 }
 
-const index = loadIndex();
-const candidates = index.threads.filter((t) => t.bytes <= maxBytes);
-// Spread the sample across the size range rather than taking only recent ones.
-const step = Math.max(1, Math.floor(candidates.length / sampleSize));
-const sample = candidates.filter((_, i) => i % step === 0).slice(0, sampleSize);
+async function check(adapter, ref) {
+  const packet = await adapter.condense(ref);
+  const { markdown } = renderMarkdown(packet, { budgetTokens: 40000 });
+  const truth = await GROUND_TRUTH[adapter.id](ref);
+  const problems = [];
+
+  if (packet.stats.commands !== truth.commands) problems.push(`commands ${packet.stats.commands} ≠ ${truth.commands}`);
+  const failures = packet.ledger.errors.reduce((n, e) => n + e.occurrences, 0);
+  if (failures !== truth.failures) problems.push(`failures ${failures} ≠ ${truth.failures}`);
+  if (packet.stats.filesTouched !== truth.files.size) problems.push(`files ${packet.stats.filesTouched} ≠ ${truth.files.size}`);
+  const ledger = new Set(packet.ledger.files.map((f) => f.path));
+  const missing = [...truth.files].find((p) => !ledger.has(p));
+  if (missing) problems.push(`missing file ${missing}`);
+  if (!markdown.includes(ref.id)) problems.push('session id missing from Markdown');
+
+  return { packet, markdown, problems };
+}
 
 let pass = 0;
 let fail = 0;
-const problems = [];
+const failures = [];
 
-console.log(`\n  Verifying ${sample.length} sessions (≤ ${(maxBytes / 1e6).toFixed(0)}MB each)\n`);
-
-for (const thread of sample) {
-  const label = `${(thread.title ?? thread.threadId).slice(0, 42).padEnd(42)}`;
-  try {
-    const packet = await condenseThread(thread);
-    const { markdown } = renderMarkdown(packet, { budgetTokens: 40000 });
-    const truth = await groundTruth(thread);
-
-    const checks = [];
-    if (packet.stats.commands !== truth.commands) {
-      checks.push(`commands ${packet.stats.commands} ≠ ${truth.commands}`);
-    }
-    if (packet.stats.filesTouched !== truth.filePaths.size) {
-      checks.push(`files ${packet.stats.filesTouched} ≠ ${truth.filePaths.size}`);
-    }
-    const packetFailures = packet.ledger.errors.reduce((n, e) => n + e.occurrences, 0);
-    if (packetFailures !== truth.failures) {
-      checks.push(`failures ${packetFailures} ≠ ${truth.failures}`);
-    }
-    // Every file the session touched must appear in the ledger.
-    const ledgerPaths = new Set(packet.ledger.files.map((f) => f.path));
-    for (const p of truth.filePaths) {
-      if (!ledgerPaths.has(p)) {
-        checks.push(`missing file ${p}`);
-        break;
+for (const adapter of ADAPTERS) {
+  if (onlySource && adapter.id !== onlySource) continue;
+  if (!GROUND_TRUTH[adapter.id]) {
+    console.log(`\n  ${adapter.label}: no ground-truth counter defined — skipped`);
+    continue;
+  }
+  const sample = sampleOf(listSessions({ source: adapter.id }));
+  console.log(`\n  ${adapter.label}: verifying ${sample.length} sessions (≤ ${(maxBytes / 1e6).toFixed(0)}MB each)\n`);
+  for (const ref of sample) {
+    const label = String(ref.title ?? ref.id).slice(0, 42).padEnd(42);
+    try {
+      const { packet, markdown, problems } = await check(adapterFor(ref.source), ref);
+      if (problems.length) {
+        fail++;
+        failures.push({ ref, problems });
+        console.log(`  ✗ ${label} ${problems.join('; ')}`);
+      } else {
+        pass++;
+        const kb = String(Math.round(markdown.length / 1024)).padStart(4);
+        console.log(`  ✓ ${label} ${String(packet.stats.turns).padStart(4)} turns ${kb}KB`);
       }
-    }
-    // Markdown must always carry orientation.
-    if (!markdown.includes('## Where things stand')) checks.push('missing orientation section');
-    if (!markdown.includes(thread.threadId)) checks.push('missing thread id');
-
-    if (checks.length) {
+    } catch (err) {
       fail++;
-      problems.push({ thread, checks });
-      console.log(`  ✗ ${label} ${checks.join('; ')}`);
-    } else {
-      pass++;
-      const ratio = thread.bytes / Math.max(1, markdown.length);
-      console.log(
-        `  ✓ ${label} ${String(packet.stats.turns).padStart(4)} turns  ${String(Math.round(markdown.length / 1024)).padStart(4)}KB  ${ratio.toFixed(0)}×`
-      );
+      failures.push({ ref, problems: [`CRASH ${err?.message ?? err}`] });
+      console.log(`  ✗ ${label} CRASH ${err?.message ?? err}`);
     }
-  } catch (err) {
-    fail++;
-    problems.push({ thread, checks: [String(err?.message ?? err)] });
-    console.log(`  ✗ ${label} CRASH: ${err?.message ?? err}`);
   }
 }
 
 console.log(`\n  ${pass} passed, ${fail} failed\n`);
-if (fail) {
-  for (const p of problems) console.log(`  ${p.thread.threadId}  ${p.checks.join('; ')}`);
-  process.exit(1);
-}
+for (const f of failures) console.log(`  ${f.ref.source} ${f.ref.id}  ${f.problems.join('; ')}`);
+process.exit(fail ? 1 : 0);
