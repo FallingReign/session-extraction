@@ -112,9 +112,30 @@ function fileLines(change) {
 
 const turnOfResponse = (p) => p?.internal_chat_message_metadata_passthrough?.turn_id;
 
+/**
+ * Newer Codex versions record each user message twice: as a response_item and
+ * as an event_msg UserMessage. Older ones record only the response_item. Pair
+ * them by arrival order within a turn so each message is kept exactly once.
+ */
+class UserMessageTwins {
+  constructor() {
+    this.counts = new Map();
+  }
+
+  /** True when this message is the second copy of one already kept. */
+  isTwin(turnId, form) {
+    const c = this.counts.get(turnId) ?? { response: 0, event: 0 };
+    this.counts.set(turnId, c);
+    c[form]++;
+    const other = form === 'response' ? c.event : c.response;
+    return c[form] <= other;
+  }
+}
+
 export async function condense(ref, limits = {}) {
   const b = new PacketBuilder(limits);
   const seenItemIds = new Set();
+  const twins = new UserMessageTwins();
   let meta = null;
   const files = [...ref.files].sort();
 
@@ -144,10 +165,10 @@ export async function condense(ref, limits = {}) {
         b.lastTokenRecord = p?.thread_token_usage ?? p?.usage ?? b.lastTokenRecord;
         break;
       case 'response_item':
-        handleResponseItem(b, p, ts);
+        handleResponseItem(b, p, ts, twins);
         break;
       case 'event_msg':
-        handleEvent(b, p, ts, seenItemIds);
+        handleEvent(b, p, ts, seenItemIds, twins);
         break;
       default:
         break;
@@ -171,10 +192,11 @@ export async function condense(ref, limits = {}) {
   });
 }
 
-function handleResponseItem(b, p, ts) {
+function handleResponseItem(b, p, ts, twins) {
   if (p.type === 'message' && p.role === 'user') {
     const text = extractUserText(p);
-    if (text) b.ask(b.turn(turnOfResponse(p), ts), text, 'user');
+    const turnId = turnOfResponse(p);
+    if (text && !twins.isTwin(turnId, 'response')) b.ask(b.turn(turnId, ts), text, 'user');
     return;
   }
   if (p.type === 'function_call_output' && DELEGATION_NAMES.has(p.name)) {
@@ -191,7 +213,7 @@ function handleResponseItem(b, p, ts) {
   // Reasoning and assistant messages are covered by their event_msg twins.
 }
 
-function handleEvent(b, p, ts, seenItemIds) {
+function handleEvent(b, p, ts, seenItemIds, twins) {
   if (p.type === 'task_started') {
     b.turn(p.turn_id, ts);
     return;
@@ -249,7 +271,7 @@ function handleEvent(b, p, ts, seenItemIds) {
     case 'UserMessage': {
       const text = (item.content ?? []).map((c) => c.text ?? '').join('\n').trim();
       const cleaned = text ? extractUserText({ content: [{ text }] }) : null;
-      if (cleaned) b.ask(t, cleaned, 'user', 'append-keep-source');
+      if (cleaned && !twins.isTwin(p.turn_id, 'event')) b.ask(t, cleaned, 'user', 'append-keep-source');
       break;
     }
     case 'WebSearch':

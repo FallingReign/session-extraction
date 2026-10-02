@@ -11,6 +11,8 @@ import { CACHE_DIR } from './core/index-cache.mjs';
 import { renderMarkdown } from './core/render-markdown.mjs';
 import { estTokens } from './core/budget.mjs';
 import { searchSession, replayTurn } from './core/retrieve.mjs';
+import { buildProject } from './core/project.mjs';
+import { renderProject } from './core/render-project.mjs';
 import { human, ago } from './core/text.mjs';
 
 // node:sqlite (used to read Copilot's per-session todo list) announces itself
@@ -34,12 +36,18 @@ const HELP = `
     view <session>                    write a packet: Markdown briefing + JSON data
     view --find "<words>" | --here | --recent N
 
+  View every session for a project folder (Codex and Copilot together)
+    project [folder]                  default: current folder, including subfolders
+      --exact                         only sessions started in exactly this folder
+      --since <date> --until <date>   limit by activity date (YYYY-MM-DD)
+      --last N                        only the N most recently active sessions
+
   Drill into the original transcript (nothing the packet drops is lost)
     search <session> "<text>" [--kind command] [--limit N] [--regex]
     turn <session> <n>                replay one turn in full, with output
 
-  <session> is a codex://threads/<id> link, a session id, or the first 8+
-  characters of one.
+  <session> is a codex://threads/<id> link, a Copilot session folder path, a
+  session id, or the first 8+ characters of one.
 
   Options
     --source ${ADAPTERS.map((a) => a.id).join('|')}   limit to one tool (default: all)
@@ -234,6 +242,53 @@ async function cmdTurn(args, common) {
   }
 }
 
+async function cmdProject(args, common) {
+  const folder = path.resolve(args._[1] ?? flagStr(args.flags.folder) ?? process.cwd());
+  const since = flagStr(args.flags.since);
+  const until = flagStr(args.flags.until);
+  let refs = sessionsForFolder(folder, { ...common, nested: !args.flags.exact });
+  if (since) refs = refs.filter((r) => Date.parse(r.updatedAt) >= Date.parse(since));
+  if (until) refs = refs.filter((r) => Date.parse(r.startedAt ?? r.updatedAt) <= Date.parse(until) + 86400000);
+  if (args.flags.last) refs = [...refs].sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, Number(args.flags.last));
+  if (!refs.length) {
+    console.error(`\n  No sessions found for ${folder}${args.flags.exact ? '' : ' (including subfolders)'}.\n`);
+    process.exit(1);
+  }
+
+  const total = refs.reduce((n, r) => n + r.bytes, 0);
+  process.stderr.write(`\n  Reading ${refs.length} session(s), ${human(total)} of session data…\n`);
+  const started = Date.now();
+  const project = await buildProject(folder, refs, {
+    onSession: (ref, i, n) => process.stderr.write(`\r  ${i + 1}/${n} ${ref.source} ${ref.id.slice(0, 8)} (${human(ref.bytes)})        `),
+  });
+  process.stderr.write('\r' + ' '.repeat(60) + '\r');
+  const { markdown: md, fit } = renderProject(project, { budgetTokens: budgetFrom(args) });
+  const elapsed = ((Date.now() - started) / 1000).toFixed(1);
+
+  if (args.flags.stdout) {
+    process.stdout.write(md);
+    return;
+  }
+  const dir = outputDir(args);
+  fs.mkdirSync(dir, { recursive: true });
+  const base = `project-view-${slugify(path.basename(folder))}-${new Date().toISOString().slice(0, 10)}`;
+  const mdPath = path.join(dir, `${base}.md`);
+  const jsonPath = path.join(dir, `${base}.json`);
+  fs.writeFileSync(mdPath, md, 'utf8');
+  fs.writeFileSync(jsonPath, JSON.stringify(project, null, 2), 'utf8');
+
+  const t = project.totals;
+  console.log('');
+  console.log(`  Project   ${folder}`);
+  console.log(`  Sessions  ${t.sessions} (${Object.entries(t.bySource).map(([s, n]) => `${n} ${s}`).join(', ')}) · read in ${elapsed}s`);
+  console.log(`  Activity  ${t.turns} turns · ${t.commands} commands · ${t.filesChanged} files changed · ${t.outstandingFailures} outstanding failure(s)`);
+  console.log(`  Report    ${human(md.length)} · ~${estTokens(md.length).toLocaleString()} tokens`);
+  if (fit.fitted) {
+    console.log(`  Fitted    cards ${fit.cards.full} full / ${fit.cards.brief} brief / ${fit.cards.omit} table-only · requests ${fit.asks.shown} of ${fit.asks.total}`);
+  }
+  console.log(`\n  → ${mdPath}\n  → ${jsonPath}\n`);
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0];
@@ -288,6 +343,8 @@ async function main() {
     }
     case 'view':
       return cmdView(args, common);
+    case 'project':
+      return cmdProject(args, common);
     case 'search':
       return cmdSearch(args, common);
     case 'turn':

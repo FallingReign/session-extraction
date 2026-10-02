@@ -34,9 +34,11 @@ export function shellOutcome(complete) {
     return { exit: 'blocked', background: false, errorText: complete?.error?.message ?? content };
   }
   const recorded = complete?.shellExecution?.exitCode;
-  if (typeof recorded === 'number') return { exit: recorded, background: false, errorText: content };
+  // The trailing exit-code marker repeats what the exit code already says.
+  const output = content.replace(EXIT_RE, '').trimEnd();
+  if (typeof recorded === 'number') return { exit: recorded, background: false, errorText: output };
   const m = EXIT_RE.exec(content);
-  if (m) return { exit: Number(m[1]), background: false, errorText: content };
+  if (m) return { exit: Number(m[1]), background: false, errorText: output };
   return { exit: 0, background: BACKGROUND_RE.test(content), errorText: '' };
 }
 

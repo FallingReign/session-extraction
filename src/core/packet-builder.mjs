@@ -29,6 +29,7 @@ export class PacketBuilder {
     this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.turns = [];
     this.turnIndex = new Map();
+    this.askTexts = new WeakMap();
     this.files = new Map();
     this.reads = new Map();
     this.commands = new Map();
@@ -77,6 +78,8 @@ export class PacketBuilder {
   /**
    * Record what the turn was asked to do.
    * mode: 'append' (sets source), 'append-keep-source', or 'if-empty'.
+   * A request identical to one already kept for the turn is a replay (agent
+   * tools re-record history across segments and compactions) and is skipped.
    */
   ask(turn, text, source = 'user', mode = 'append') {
     if (!text) return;
@@ -87,6 +90,11 @@ export class PacketBuilder {
       return;
     }
     const c = clip(text, this.limits.maxUserChars);
+    const kept = this.askTexts.get(turn) ?? new Set();
+    const key = c.replace(/\s+/g, ' ').trim();
+    if (kept.has(key)) return;
+    kept.add(key);
+    this.askTexts.set(turn, kept);
     turn.ask = turn.ask ? `${turn.ask}\n\n${c}` : c;
     turn.askSource = mode === 'append-keep-source' ? (turn.askSource ?? source) : source;
   }

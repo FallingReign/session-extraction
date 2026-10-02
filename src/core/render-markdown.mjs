@@ -6,26 +6,18 @@
  * arrives tagged full / brief / digest and is rendered accordingly.
  */
 import { planBudget, estTokens } from './budget.mjs';
+import {
+  fmtDuration,
+  fmtTime,
+  fmtSize as human,
+  dedupe,
+  blockquote,
+  clipDoc,
+  shortLine as oneLine,
+  sourceLabel,
+} from './format.mjs';
 
-const pad = (n) => String(n).padStart(2, '0');
-
-function fmtDuration(ms) {
-  if (!ms || ms < 0) return '';
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m${pad(s % 60)}s`;
-  return `${Math.floor(m / 60)}h${pad(m % 60)}m`;
-}
-
-function fmtTime(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-const human = (n) =>
-  n > 1e9 ? `${(n / 1e9).toFixed(2)} GB` : n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+export { sourceLabel };
 
 const ICON = {
   exec: '$',
@@ -43,9 +35,6 @@ const ICON = {
   error: '!',
 };
 
-const SOURCE_LABELS = { codex: 'Codex', copilot: 'Copilot' };
-export const sourceLabel = (id) => SOURCE_LABELS[id] ?? id ?? 'Agent';
-
 /** Collapse a turn's actions into deduped, run-length-encoded lines. */
 function collapseActions(actions) {
   const out = [];
@@ -61,26 +50,6 @@ function collapseActions(actions) {
   }
   return out;
 }
-
-const dedupe = (arr) => [...new Set(arr)];
-
-function blockquote(text) {
-  return String(text)
-    .trim()
-    .split('\n')
-    .map((l) => `> ${l}`)
-    .join('\n');
-}
-
-function clipDoc(s, n) {
-  const t = String(s ?? '').trim();
-  return t.length <= n ? t : t.slice(0, n) + `\n\n…[+${t.length - n} chars omitted]`;
-}
-
-const oneLine = (s, n) => {
-  const t = String(s ?? '').replace(/\s+/g, ' ').trim();
-  return t.length <= n ? t : t.slice(0, n) + '…';
-};
 
 /** The parts of the packet a reader always needs, whatever the budget. */
 function renderSpine(packet, opts) {

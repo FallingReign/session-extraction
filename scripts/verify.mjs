@@ -105,6 +105,14 @@ async function check(adapter, ref) {
   const missing = [...truth.files].find((p) => !ledger.has(p));
   if (missing) problems.push(`missing file ${missing}`);
   if (!markdown.includes(ref.id)) problems.push('session id missing from Markdown');
+  // The same request text recorded twice in a row means two copies of one message were kept.
+  for (const t of packet.turns) {
+    const blocks = String(t.ask ?? '').split('\n\n').map((s) => s.trim()).filter((s) => s.length > 20);
+    if (blocks.some((s, i) => i > 0 && s === blocks[i - 1])) {
+      problems.push(`turn ${t.n} repeats a request`);
+      break;
+    }
+  }
 
   return { packet, markdown, problems };
 }
