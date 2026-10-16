@@ -43,6 +43,7 @@ for (const name of skills) {
     examples: {
       view: `${command} view <session>`,
       project: `${command} project <folder>`,
+      corpus: `${command} corpus --since 7d [--exclude <folder>] [--packets]`,
       find: `${command} find "<words>"`,
       here: `${command} here --folder <folder>`,
       search: `${command} search <session> "<text>"`,

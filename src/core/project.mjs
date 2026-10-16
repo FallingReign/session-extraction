@@ -1,6 +1,7 @@
 /**
  * Project view: every session whose working folder is a given project folder,
  * from every source, condensed and aggregated into one analysis-ready record.
+ * The corpus view reuses it with no folder: every session in a time window.
  *
  * Each session is condensed in turn and reduced to a card plus the facts that
  * aggregate across sessions; the full packet is then released, so memory stays
@@ -68,21 +69,32 @@ function cardOf(ref, packet, code) {
 
 /**
  * Condense and aggregate sessions (already selected by the caller).
+ * folder is the project folder, or null for a corpus spanning many folders.
  * onSession(ref, index, total) reports progress.
+ * onPacket(ref, packet, card) sees each full packet before it is released; a
+ * returned value is recorded on the card as `packet` (e.g. the written path).
  */
-export async function buildProject(folder, refs, { onSession } = {}) {
+export async function buildProject(folder, refs, { onSession, onPacket } = {}) {
   const ordered = [...refs].sort((a, b) => Date.parse(a.startedAt ?? a.updatedAt) - Date.parse(b.startedAt ?? b.updatedAt));
   const cards = [];
   const files = new Map();
   const failures = new Map();
   const tools = new Map();
+  const folders = new Map();
 
   for (let i = 0; i < ordered.length; i++) {
     const ref = ordered[i];
     onSession?.(ref, i, ordered.length);
     const packet = await adapterFor(ref.source).condense(ref);
     const card = cardOf(ref, packet, `S${i + 1}`);
+    if (onPacket) card.packet = (await onPacket(ref, packet, card)) ?? null;
     cards.push(card);
+
+    const dir = card.cwd ?? '(unknown)';
+    const fe = folders.get(dir.toLowerCase()) ?? { folder: dir, sessions: [], turns: 0 };
+    fe.sessions.push(card.code);
+    fe.turns += card.stats.turns ?? 0;
+    folders.set(dir.toLowerCase(), fe);
 
     for (const f of card.files) {
       const e = files.get(f.path) ?? { path: f.path, sessions: [], changes: 0 };
@@ -120,6 +132,7 @@ export async function buildProject(folder, refs, { onSession } = {}) {
       startedAt: cards[0]?.startedAt ?? null,
       updatedAt: cards.reduce((m, c) => (Date.parse(c.updatedAt) > Date.parse(m ?? 0) ? c.updatedAt : m), null),
     },
+    folders: [...folders.values()].sort((a, b) => b.sessions.length - a.sessions.length || b.turns - a.turns),
     files: [...files.values()].sort((a, b) => b.sessions.length - a.sessions.length || b.changes - a.changes),
     failures: [...failures.values()].sort((a, b) => b.sessions.length - a.sessions.length || b.occurrences - a.occurrences),
     tools: [...tools.entries()].map(([tool, calls]) => ({ tool, calls })).sort((a, b) => b.calls - a.calls),

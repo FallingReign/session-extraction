@@ -36,11 +36,14 @@ node src/cli.mjs view 1a2b3c4d                      # any session, by id prefix
 node src/cli.mjs project ~/code/my-app              # every session for a project
 node src/cli.mjs project . --since 2026-09-01 --last 20
 
+node src/cli.mjs corpus --since 7d                  # every session in the window, any folder
+node src/cli.mjs corpus --since 7d --exclude ~/code/reviewer --packets
+
 node src/cli.mjs search 1a2b3c4d "TypeError"        # find anything, incl. output
 node src/cli.mjs turn 1a2b3c4d 12                   # replay one turn in full
 ```
 
-`view` and `project` write a Markdown view and a JSON file with the full
+`view`, `project` and `corpus` write a Markdown view and a JSON file with the full
 structured data (default folder `~/.copilot/session-extraction/packets`, or
 `--out <dir>`, or `--stdout`). `--budget <tokens>` sets the size (default
 40000); `--budget none` renders everything. `--source codex|copilot` limits to
@@ -61,6 +64,14 @@ Every session whose working folder is the project or a subfolder, from both
 tools, coded S1, S2, … in start order: overview, session table, latest state,
 unfinished plan items, files changed in more than one session, failures that
 recur across sessions, a card per session, and every user request in order.
+
+### Corpus view
+
+The project view for every session active in a time window, across all
+folders, plus a folders table. Requires `--since` (`YYYY-MM-DD`, ISO time, or
+an age such as `7d`) or `--last N`. `--exclude <folder>` (repeatable) leaves out
+a folder tree. `--packets` also writes each session's own view beside the
+report (`--packet-budget`, default 12000 tokens), for per-session review.
 
 ## Agent skill
 

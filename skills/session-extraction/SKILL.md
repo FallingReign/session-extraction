@@ -1,6 +1,6 @@
 ---
 name: session-extraction
-description: Review or analyse past Codex and Copilot CLI agent sessions without reading raw transcripts. Use when asked to look at, review, summarise, compare or gather data from agent sessions, session history or session files; when given a codex://threads/<id> link, a Copilot session folder path or session id to inspect; or when asked what happened across sessions in a project folder. Produces deterministic, context-dense views and searches the original transcripts on demand. To continue a Codex session's work instead of reviewing it, use resume-codex-session.
+description: Review or analyse past Codex and Copilot CLI agent sessions without reading raw transcripts. Use when asked to look at, review, summarise, compare or gather data from agent sessions, session history or session files; when given a codex://threads/<id> link, a Copilot session folder path or session id to inspect; or when asked what happened across sessions in a project folder or across all recent sessions. Produces deterministic, context-dense views and searches the original transcripts on demand. To continue a Codex session's work instead of reviewing it, use resume-codex-session.
 ---
 
 # Session extraction
@@ -33,6 +33,7 @@ examples. Resolve session ids and paths yourself; do not ask the user for them.
 | One session reviewed | `view <session>` |
 | Everything that happened in a project | `project <folder>` |
 | Several projects | `project` once per folder, then compare the outputs |
+| Every session in a time window, any folder (e.g. a weekly review) | `corpus --since 7d [--exclude <folder>] [--packets]` |
 | To find a session | `find "<words>"`, `here --folder <dir>`, `list` |
 | A detail the view left out | `search <session> "<text>"`, `turn <session> <n>` |
 
@@ -73,14 +74,24 @@ model-written by the original tool. Treat them as claims, not records.
 ## Reading a project view (`project`)
 
 Covers every session whose working folder is the project folder or one of its
-subfolders (`--exact` for the folder only). Narrow with `--since YYYY-MM-DD`,
-`--until YYYY-MM-DD` or `--last N`.
+subfolders (`--exact` for the folder only). Narrow with `--since`, `--until`
+(each `YYYY-MM-DD`, an ISO time, or an age like `7d` / `12h`) or `--last N`.
 
 Sessions get codes **S1, S2, …** in start order; use these codes when you
 report. The report holds: an overview, the session table, the latest state,
 unfinished plan items, files changed in more than one session, outstanding
 failures that recur across sessions, a card per session, and every user
 request in order, one line each.
+
+## Reading a corpus view (`corpus`)
+
+The project view for every session active in a time window, whatever its
+folder, plus a folders table. It requires `--since` or `--last`. Use
+`--exclude <folder>` (repeatable) to leave out a folder and its subfolders,
+for example the reviewing tool's own sessions. `--packets` also writes each
+session's own view (default 12,000 tokens, `--packet-budget` to change) into a
+`-sessions` folder beside the report; each card's `packet` field in the JSON
+holds its path.
 
 ## Analysis
 
@@ -92,7 +103,8 @@ the Markdown left out.
   `reasoning`, `actions`), `ledger` (`files`, `reads`, `commands`, `errors`,
   `outstanding`, `mcp`, `searches`, `delegations`), `stats`.
 - Project JSON: `totals`, `sessions[]` (one card each, including every request
-  in `asks[]`), `files[]`, `failures[]`, `tools[]`.
+  in `asks[]`), `folders[]`, `files[]`, `failures[]`, `tools[]`. A corpus JSON
+  has the same shape with `folder: null` and a `window`.
 
 Report findings against what the user asked for, cite session codes or turn
 numbers, and say when a finding rests on model-written text.

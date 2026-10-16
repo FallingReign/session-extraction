@@ -6,7 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
-import { listSessions, openSession, findSessions, sessionsForFolder, ADAPTERS } from './core/sources.mjs';
+import { listSessions, openSession, findSessions, sessionsForFolder, normDir, ADAPTERS } from './core/sources.mjs';
 import { CACHE_DIR } from './core/index-cache.mjs';
 import { renderMarkdown } from './core/render-markdown.mjs';
 import { estTokens } from './core/budget.mjs';
@@ -39,8 +39,14 @@ const HELP = `
   View every session for a project folder (Codex and Copilot together)
     project [folder]                  default: current folder, including subfolders
       --exact                         only sessions started in exactly this folder
-      --since <date> --until <date>   limit by activity date (YYYY-MM-DD)
+      --since <when> --until <when>   limit by activity (YYYY-MM-DD, ISO time, or 7d / 12h)
       --last N                        only the N most recently active sessions
+
+  View every session active in a time window, across all folders
+    corpus --since <when> | --last N  same report as project, plus a folders table
+      --exclude <folder>              skip sessions in a folder and its subfolders (repeatable)
+      --packets                       also write each session's own view beside the report
+      --packet-budget <tokens>        size of each session view (default 12000)
 
   Drill into the original transcript (nothing the packet drops is lost)
     search <session> "<text>" [--kind command] [--limit N] [--regex]
@@ -60,19 +66,54 @@ const HELP = `
 
 function parseArgs(argv) {
   const out = { _: [], flags: {} };
+  const set = (k, v) => {
+    // A repeated flag keeps every value (e.g. --exclude a --exclude b).
+    out.flags[k] = k in out.flags ? [].concat(out.flags[k], v) : v;
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
-      if (eq !== -1) out.flags[a.slice(2, eq)] = a.slice(eq + 1);
-      else if (argv[i + 1] && !argv[i + 1].startsWith('--')) out.flags[a.slice(2)] = argv[++i];
-      else out.flags[a.slice(2)] = true;
+      if (eq !== -1) set(a.slice(2, eq), a.slice(eq + 1));
+      else if (argv[i + 1] && !argv[i + 1].startsWith('--')) set(a.slice(2), argv[++i]);
+      else set(a.slice(2), true);
     } else out._.push(a);
   }
   return out;
 }
 
-const flagStr = (v) => (v === true || v === undefined ? null : String(v));
+const flagStr = (v) => (Array.isArray(v) ? flagStr(v[v.length - 1]) : v === true || v === undefined ? null : String(v));
+const flagList = (v) => [].concat(v ?? []).filter((x) => x !== true).map(String);
+
+/**
+ * A point in time from a flag: YYYY-MM-DD, an ISO timestamp, or a relative
+ * age such as 7d or 12h. A bare date used as an upper bound means end of day.
+ */
+function parseWhen(value, { endOfDay = false } = {}) {
+  if (!value) return null;
+  const rel = /^(\d+)([dh])$/i.exec(value);
+  if (rel) return Date.now() - Number(rel[1]) * (rel[2].toLowerCase() === 'd' ? 86400000 : 3600000);
+  const ms = Date.parse(value);
+  if (Number.isNaN(ms)) throw new Error(`cannot read "${value}" as a time — use YYYY-MM-DD, an ISO timestamp, or an age like 7d / 12h`);
+  return endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(value) ? ms + 86400000 : ms;
+}
+
+/** Applies --since, --until and --last to a list of session refs. */
+function selectWindow(refs, args) {
+  const since = parseWhen(flagStr(args.flags.since));
+  const until = parseWhen(flagStr(args.flags.until), { endOfDay: true });
+  let out = refs;
+  if (since !== null) out = out.filter((r) => Date.parse(r.updatedAt) >= since);
+  if (until !== null) out = out.filter((r) => Date.parse(r.startedAt ?? r.updatedAt) <= until);
+  if (args.flags.last) out = [...out].sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, Number(flagStr(args.flags.last)));
+  return {
+    refs: out,
+    window: {
+      since: since !== null ? new Date(since).toISOString() : null,
+      until: until !== null ? new Date(until).toISOString() : null,
+    },
+  };
+}
 
 function printTable(sessions, limit = 20) {
   const w = (s, n) => {
@@ -145,10 +186,22 @@ const slugify = (s) =>
     .replace(/^-|-$/g, '')
     .slice(0, 50) || 'session';
 
-function budgetFrom(args) {
-  const v = args.flags.budget;
+function budgetFrom(args, flag = 'budget', fallback = 40000) {
+  const v = flagStr(args.flags[flag]);
   if (v === 'none' || v === 'full') return null;
-  return Number(v ?? 40000) || null;
+  return Number(v ?? fallback) || null;
+}
+
+/** Writes one session view (Markdown + JSON) and returns its paths. */
+function writePacket(dir, ref, packet, budgetTokens) {
+  const { markdown: md, budget } = renderMarkdown(packet, { budgetTokens });
+  fs.mkdirSync(dir, { recursive: true });
+  const base = `session-view-${ref.source}-${slugify(packet.session.title)}-${ref.id.slice(0, 8)}`;
+  const mdPath = path.join(dir, `${base}.md`);
+  const jsonPath = path.join(dir, `${base}.json`);
+  fs.writeFileSync(mdPath, md, 'utf8');
+  fs.writeFileSync(jsonPath, JSON.stringify(packet, null, 2), 'utf8');
+  return { md, budget, mdPath, jsonPath };
 }
 
 async function cmdView(args, common) {
@@ -157,22 +210,14 @@ async function cmdView(args, common) {
   process.stderr.write(`\n  Reading ${human(ref.bytes)} of ${adapter.label} session data…\n`);
   const started = Date.now();
   const packet = await adapter.condense(ref);
-  const { markdown: md, budget } = renderMarkdown(packet, { budgetTokens });
-  const elapsed = ((Date.now() - started) / 1000).toFixed(1);
 
   if (args.flags.stdout) {
-    process.stdout.write(md);
+    process.stdout.write(renderMarkdown(packet, { budgetTokens }).markdown);
     return;
   }
 
-  const dir = outputDir(args);
-  fs.mkdirSync(dir, { recursive: true });
-  const base = `session-view-${ref.source}-${slugify(packet.session.title)}-${ref.id.slice(0, 8)}`;
-  const mdPath = path.join(dir, `${base}.md`);
-  const jsonPath = path.join(dir, `${base}.json`);
-  fs.writeFileSync(mdPath, md, 'utf8');
-  fs.writeFileSync(jsonPath, JSON.stringify(packet, null, 2), 'utf8');
-
+  const { md, budget, mdPath, jsonPath } = writePacket(outputDir(args), ref, packet, budgetTokens);
+  const elapsed = ((Date.now() - started) / 1000).toFixed(1);
   const s = packet.stats;
   console.log('');
   console.log(`  Session   ${packet.session.title ?? ref.id}  (${adapter.label})`);
@@ -242,25 +287,19 @@ async function cmdTurn(args, common) {
   }
 }
 
-async function cmdProject(args, common) {
-  const folder = path.resolve(args._[1] ?? flagStr(args.flags.folder) ?? process.cwd());
-  const since = flagStr(args.flags.since);
-  const until = flagStr(args.flags.until);
-  let refs = sessionsForFolder(folder, { ...common, nested: !args.flags.exact });
-  if (since) refs = refs.filter((r) => Date.parse(r.updatedAt) >= Date.parse(since));
-  if (until) refs = refs.filter((r) => Date.parse(r.startedAt ?? r.updatedAt) <= Date.parse(until) + 86400000);
-  if (args.flags.last) refs = [...refs].sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, Number(args.flags.last));
-  if (!refs.length) {
-    console.error(`\n  No sessions found for ${folder}${args.flags.exact ? '' : ' (including subfolders)'}.\n`);
-    process.exit(1);
-  }
-
+/** Condenses the selected sessions, renders the report, writes both files and prints a receipt. */
+async function writeReport(args, { folder, refs, window, base, heading }) {
   const total = refs.reduce((n, r) => n + r.bytes, 0);
   process.stderr.write(`\n  Reading ${refs.length} session(s), ${human(total)} of session data…\n`);
   const started = Date.now();
+  const dir = outputDir(args);
+  const packetDir = args.flags.packets ? path.join(dir, `${base}-sessions`) : null;
+  const packetBudget = budgetFrom(args, 'packet-budget', 12000);
   const project = await buildProject(folder, refs, {
     onSession: (ref, i, n) => process.stderr.write(`\r  ${i + 1}/${n} ${ref.source} ${ref.id.slice(0, 8)} (${human(ref.bytes)})        `),
+    onPacket: packetDir ? (ref, packet) => writePacket(packetDir, ref, packet, packetBudget).mdPath : undefined,
   });
+  if (window) project.window = window;
   process.stderr.write('\r' + ' '.repeat(60) + '\r');
   const { markdown: md, fit } = renderProject(project, { budgetTokens: budgetFrom(args) });
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
@@ -269,9 +308,7 @@ async function cmdProject(args, common) {
     process.stdout.write(md);
     return;
   }
-  const dir = outputDir(args);
   fs.mkdirSync(dir, { recursive: true });
-  const base = `project-view-${slugify(path.basename(folder))}-${new Date().toISOString().slice(0, 10)}`;
   const mdPath = path.join(dir, `${base}.md`);
   const jsonPath = path.join(dir, `${base}.json`);
   fs.writeFileSync(mdPath, md, 'utf8');
@@ -279,14 +316,58 @@ async function cmdProject(args, common) {
 
   const t = project.totals;
   console.log('');
-  console.log(`  Project   ${folder}`);
+  console.log(`  ${heading}`);
   console.log(`  Sessions  ${t.sessions} (${Object.entries(t.bySource).map(([s, n]) => `${n} ${s}`).join(', ')}) · read in ${elapsed}s`);
   console.log(`  Activity  ${t.turns} turns · ${t.commands} commands · ${t.filesChanged} files changed · ${t.outstandingFailures} outstanding failure(s)`);
   console.log(`  Report    ${human(md.length)} · ~${estTokens(md.length).toLocaleString()} tokens`);
   if (fit.fitted) {
     console.log(`  Fitted    cards ${fit.cards.full} full / ${fit.cards.brief} brief / ${fit.cards.omit} table-only · requests ${fit.asks.shown} of ${fit.asks.total}`);
   }
-  console.log(`\n  → ${mdPath}\n  → ${jsonPath}\n`);
+  console.log(`\n  → ${mdPath}\n  → ${jsonPath}`);
+  if (packetDir) console.log(`  → ${packetDir}  (${t.sessions} session views, ~${(packetBudget ?? 'full').toLocaleString()} tokens max each)`);
+  console.log('');
+}
+
+async function cmdProject(args, common) {
+  const folder = path.resolve(args._[1] ?? flagStr(args.flags.folder) ?? process.cwd());
+  const { refs } = selectWindow(sessionsForFolder(folder, { ...common, nested: !args.flags.exact }), args);
+  if (!refs.length) {
+    console.error(`\n  No sessions found for ${folder}${args.flags.exact ? '' : ' (including subfolders)'}.\n`);
+    process.exit(1);
+  }
+  await writeReport(args, {
+    folder,
+    refs,
+    base: `project-view-${slugify(path.basename(folder))}-${new Date().toISOString().slice(0, 10)}`,
+    heading: `Project   ${folder}`,
+  });
+}
+
+async function cmdCorpus(args, common) {
+  if (!args.flags.since && !args.flags.last) {
+    console.error('\n  corpus needs --since <when> or --last N (e.g. --since 7d). It spans every folder, so an unbounded run would read all history.\n');
+    process.exit(2);
+  }
+  const excluded = flagList(args.flags.exclude).map((e) => path.resolve(e));
+  const ex = excluded.map(normDir);
+  const inExcluded = (cwd) => {
+    if (!cwd) return false;
+    const c = normDir(cwd);
+    return ex.some((e) => c === e || c.startsWith(e + path.sep));
+  };
+  const all = listSessions(common).filter((r) => !inExcluded(r.cwd));
+  const { refs, window } = selectWindow(all, args);
+  if (!refs.length) {
+    console.log(`\n  corpus: 0 sessions active ${window.since ? `since ${window.since}` : 'in the window'}${excluded.length ? ` outside ${excluded.length} excluded folder(s)` : ''}.\n`);
+    return;
+  }
+  await writeReport(args, {
+    folder: null,
+    refs,
+    window: { ...window, excluded },
+    base: `corpus-view-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}`,
+    heading: `Corpus    ${window.since ?? 'start'} → ${window.until ?? 'now'}${excluded.length ? ` · ${excluded.length} folder(s) excluded` : ''}`,
+  });
 }
 
 async function main() {
@@ -345,6 +426,8 @@ async function main() {
       return cmdView(args, common);
     case 'project':
       return cmdProject(args, common);
+    case 'corpus':
+      return cmdCorpus(args, common);
     case 'search':
       return cmdSearch(args, common);
     case 'turn':

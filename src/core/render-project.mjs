@@ -16,11 +16,15 @@ const CARD_TIERS = ['omit', 'brief', 'full'];
 const ASK_LINE = 220;
 const len = (s) => (s ? String(s).length : 0);
 
-/** Paths inside the project folder are shown relative to it. */
+/** Paths inside the project folder are shown relative to it; a corpus has no single folder. */
 const relativeTo = (folder) => (p) => {
+  if (!folder) return p;
   const rel = path.relative(folder, p);
   return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : p;
 };
+
+/** "2026-10-09 → now", from the selection window the CLI recorded. */
+const windowLabel = (w) => (w ? `${w.since ? fmtTime(w.since) : 'start'} → ${w.until ? fmtTime(w.until) : 'now'}` : null);
 
 function cardCost(card, tier) {
   if (tier === 'omit') return 0;
@@ -47,14 +51,20 @@ function renderSpine(p) {
     .map(([s, n]) => `${n} ${sourceLabel(s)}`)
     .join(', ');
 
-  L.push(`# Project view — ${p.folder}`);
+  const corpus = !p.folder;
+  L.push(corpus ? `# Corpus view — ${windowLabel(p.window) ?? 'all sessions'}` : `# Project view — ${p.folder}`);
   L.push('');
-  L.push('> Every recorded agent session for this folder, condensed deterministically. Requests and replies are quoted verbatim;');
+  L.push(
+    corpus
+      ? '> Every recorded agent session active in this window, across all folders, condensed deterministically. Requests and replies are quoted verbatim;'
+      : '> Every recorded agent session for this folder, condensed deterministically. Requests and replies are quoted verbatim;'
+  );
   L.push('> everything else is reduced by fixed rules. Session codes (S1, S2, …) are in start order and are used throughout.');
   L.push('');
   L.push('| | |');
   L.push('|---|---|');
-  L.push(`| Folder | \`${p.folder}\` |`);
+  L.push(corpus ? `| Folders | ${p.folders.length} |` : `| Folder | \`${p.folder}\` |`);
+  if (corpus && p.window?.excluded?.length) L.push(`| Excluded | ${p.window.excluded.map((e) => `\`${cell(e)}\``).join(', ')} |`);
   L.push(`| Sessions | ${t.sessions} (${sources || 'none'}) |`);
   L.push(`| Span | ${fmtTime(t.startedAt)} → ${fmtTime(t.updatedAt)} |`);
   L.push(
@@ -62,6 +72,16 @@ function renderSpine(p) {
   );
   L.push(`| Source data | ${fmtSize(t.bytes)} |`);
   L.push('');
+
+  if (corpus && p.folders.length) {
+    L.push('## Folders');
+    L.push('');
+    L.push('| Folder | Sessions | Turns |');
+    L.push('|---|---|--:|');
+    for (const f of p.folders.slice(0, 25)) L.push(`| \`${cell(f.folder)}\` | ${f.sessions.join(', ')} | ${f.turns} |`);
+    if (p.folders.length > 25) L.push(`| _…${p.folders.length - 25} more in the JSON_ | | |`);
+    L.push('');
+  }
 
   L.push('## Sessions');
   L.push('');
@@ -108,8 +128,10 @@ function renderSpine(p) {
     const list = (shared.length ? shared : p.files).slice(0, 25);
     L.push(shared.length ? '## Files changed in more than one session' : '## Most-changed files');
     L.push('');
-    L.push('_Paths are relative to the project folder unless outside it._');
-    L.push('');
+    if (!corpus) {
+      L.push('_Paths are relative to the project folder unless outside it._');
+      L.push('');
+    }
     L.push('| File | Sessions | Changes |');
     L.push('|---|---|--:|');
     for (const f of list) L.push(`| \`${cell(rel(f.path))}\` | ${[...new Set(f.sessions)].join(', ')} | ${f.changes} |`);
@@ -180,6 +202,7 @@ export function renderProject(p, { budgetTokens = null } = {}) {
   const footer = [
     '## Drill down',
     '',
+    ...(p.sessions.some((c) => c.packet) ? ['- Each session\'s own view is at the `packet` path on its card in the JSON'] : []),
     '- One session in detail: `session-extract view <id>`',
     '- Anything said or run in a session, including output: `session-extract search <id> "<text>"`',
     '- One turn in full: `session-extract turn <id> <n>`',

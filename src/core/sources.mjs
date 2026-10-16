@@ -79,7 +79,7 @@ export function findSessions(query, opts = {}) {
     .map((r) => r.ref);
 }
 
-const normDir = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
+export const normDir = (p) => path.resolve(p).replace(/[\\/]+$/, '').toLowerCase();
 
 /** Sessions whose working directory is the folder, or (with nested) inside it. */
 export function sessionsForFolder(folder, { nested = false, ...opts } = {}) {
