@@ -6,6 +6,7 @@
  * source, and an installation.json with the resolved Node path and ready-to-run
  * commands. All skills run the same code. Re-run after pulling changes.
  *
+ *   npx -y github:FallingReign/session-extraction [--dir <skills folder>]
  *   node scripts/install-skill.mjs [--dir <skills folder>]
  *
  * Default skills folder: ~/.agents/skills (override with --dir or SKILLS_DIR).
@@ -16,6 +17,9 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+// A clone records its folder; an npx run records the GitHub source, not its temporary cache.
+const sourceRepo = fs.existsSync(path.join(repoRoot, '.git')) ? repoRoot : pkg.repository;
 const dirFlag = process.argv.indexOf('--dir');
 const skillsRoot =
   (dirFlag !== -1 && process.argv[dirFlag + 1]) || process.env.SKILLS_DIR || path.join(os.homedir(), '.agents', 'skills');
@@ -50,7 +54,7 @@ for (const name of skills) {
       turn: `${command} turn <session> <n>`,
     },
     installedAt: new Date().toISOString(),
-    sourceRepo: repoRoot,
+    sourceRepo,
   };
   fs.writeFileSync(path.join(target, 'installation.json'), JSON.stringify(installation, null, 2), 'utf8');
   console.log(`  Installed ${name} → ${target}`);

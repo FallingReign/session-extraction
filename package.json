@@ -4,8 +4,10 @@
   "description": "Deterministic, context-dense views of Codex and Copilot CLI agent sessions.",
   "type": "module",
   "license": "MIT",
+  "repository": "github:FallingReign/session-extraction",
   "bin": {
-    "session-extract": "src/cli.mjs"
+    "session-extract": "src/cli.mjs",
+    "session-extraction": "scripts/install-skill.mjs"
   },
   "scripts": {
     "verify": "node scripts/verify.mjs",

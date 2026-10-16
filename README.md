@@ -76,8 +76,11 @@ report (`--packet-budget`, default 12000 tokens), for per-session review.
 ## Agent skill
 
 ```sh
-node scripts/install-skill.mjs            # installs every skill under skills/ to ~/.agents/skills
+npx -y github:FallingReign/session-extraction   # installs every skill under skills/ to ~/.agents/skills, no clone needed
+node scripts/install-skill.mjs                   # same, from a clone
 ```
+
+Add `--dir <folder>` to install elsewhere.
 
 Two skills, both running the same code:
 
